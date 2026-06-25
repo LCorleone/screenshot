@@ -1,14 +1,22 @@
 name: Build
 
+# Branch policy:
+#   - main     -> builds AUTOMATICALLY on every push (auto trigger).
+#                 This is the tested/stable branch; only merge here after QA.
+#   - july-dev -> builds ONLY when manually triggered (workflow_dispatch).
+#                 Development happens here without auto-builds.
+#
+# How to manually trigger a july-dev build:
+#   GitHub UI:  Actions tab -> "Build" -> "Run workflow" -> branch: july-dev
+#   CLI:        gh workflow run build.yml --repo LCorleone/screenshot -r july-dev
 on:
   push:
     branches: [main, master]
-  pull_request:
-  workflow_dispatch:
+  workflow_dispatch: # manual trigger from any branch (used for july-dev)
 
 jobs:
   build-windows:
-    name: Build (Windows)
+    name: Build (Windows, ${{ github.ref_name }})
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,12 +29,13 @@ jobs:
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
-          name: screenshot-dai-windows
+          # Include the branch name so dev vs main artifacts don't collide.
+          name: screenshot-dai-windows-${{ github.ref_name }}
           path: target/release/screenshot-dai.exe
           if-no-files-found: error
 
   check-linux:
-    name: Check (Linux, fast feedback)
+    name: Check (Linux, ${{ github.ref_name }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
