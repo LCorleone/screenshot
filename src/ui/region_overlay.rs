@@ -31,7 +31,14 @@ use image::RgbaImage;
 /// stroke is ignored.
 const MIN_DRAG: f32 = 4.0;
 /// Maximum number of full-doc snapshots kept for undo.
-const UNDO_CAP: usize = 50;
+/// Max number of full-doc snapshots kept for undo. Each snapshot is a full
+/// physical-resolution `RgbaImage`, so this is also bounded by
+/// [`UNDO_BYTES_BUDGET`] (whichever binds first). Kept modest to bound memory
+/// on large (e.g. 4K) captures.
+const UNDO_CAP: usize = 10;
+/// Soft byte budget for the undo stack (~256 MB). Oldest snapshots are dropped
+/// once exceeded, in addition to the [`UNDO_CAP`] count limit.
+const UNDO_BYTES_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Overlay phase.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,13 +190,22 @@ impl RegionSession {
     /// texture. Ordering guarantees undo restores the pre-edit state.
     fn commit_doc(&mut self, ctx: &egui::Context, new_doc: RgbaImage) {
         if let Some(old) = self.doc.take() {
-            if self.undo_stack.len() >= UNDO_CAP {
+            self.undo_stack.push(old);
+            // Bound by both count and total bytes; drop oldest when exceeded.
+            while self.undo_stack.len() > UNDO_CAP {
                 self.undo_stack.remove(0);
             }
-            self.undo_stack.push(old);
+            while self.undo_bytes() > UNDO_BYTES_BUDGET && self.undo_stack.len() > 1 {
+                self.undo_stack.remove(0);
+            }
         }
         self.doc = Some(new_doc);
         self.refresh_doc_texture(ctx);
+    }
+
+    /// Total bytes currently held in the undo stack.
+    fn undo_bytes(&self) -> usize {
+        self.undo_stack.iter().map(|img| img.len()).sum()
     }
 
     /// Transition from `Select` to `Edit`: crop the selection, make it the doc,
@@ -359,18 +375,22 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             }
 
             // Live rectangle-tool preview (painter only; no doc mutation yet).
+            // Matches the rasterizer: dark outer band, white inner band inset
+            // by ~t_dark logical px so the white outline sits inside the dark.
             if r.active_tool == Tool::Rect {
                 if let (Some(ds), Some(dc)) = (r.rect_drag_start, r.rect_drag_cur) {
                     let rect = Rect::from_two_pos(ds, dc);
-                    // thin dark outline behind, white outline in front
                     painter.rect_stroke(
                         rect,
                         0.0,
                         Stroke::new(3.0, Color32::from_black_alpha(220)),
                         egui::epaint::StrokeKind::Inside,
                     );
+                    // ~1 logical pt inset ~= t_dark at scale 1.0 (good enough
+                    // for a live preview; the rasterizer is the source of truth).
+                    let inner = rect.shrink2(Vec2::splat(1.0));
                     painter.rect_stroke(
-                        rect,
+                        inner,
                         0.0,
                         Stroke::new(2.0, Color32::WHITE),
                         egui::epaint::StrokeKind::Inside,

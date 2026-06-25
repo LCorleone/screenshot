@@ -56,6 +56,9 @@ pub struct ScreenshotDaiApp {
     /// yet started. Captures must start from within `ui()` where we have the
     /// egui ctx, so the global channel handlers just flip this flag.
     capture_requested: bool,
+    /// True when the user asked to quit via the tray. Distinguishes a Quit
+    /// (actually exit) from a Settings-window X close (hide only).
+    quitting: bool,
     /// Floating pinned-screenshot windows created via the editor's Pin action.
     pins: Vec<Arc<Mutex<pin_window::PinSession>>>,
     /// Monotonic id source for the next pin window.
@@ -140,6 +143,7 @@ impl ScreenshotDaiApp {
             last_scale: 1.0,
             window_visible: false,
             capture_requested: false,
+            quitting: false,
             pins: Vec::new(),
             next_pin_id: 0,
             tray,
@@ -186,19 +190,28 @@ impl eframe::App for ScreenshotDaiApp {
             } else if ev.id == *self.capture_item.id() {
                 self.capture_requested = true;
             } else if ev.id == *self.quit_item.id() {
+                self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 
         // --- 3. Start a region capture if one was requested (needs the ctx). ---
+        // Ignore the request if an overlay is already open (re-entrant hotkey /
+        // double Capture-menu click) so we don't discard the in-progress session.
         if self.capture_requested {
             self.capture_requested = false;
-            match region_overlay::start_session(&ctx) {
-                Ok(s) => {
-                    self.region_session = Some(Arc::new(Mutex::new(s)));
-                    self.message.clear();
+            if self.region_session.is_some() {
+                tracing::info!("capture requested but a session is already open; ignoring");
+            } else {
+                match region_overlay::start_session(&ctx) {
+                    Ok(s) => {
+                        self.region_session = Some(Arc::new(Mutex::new(s)));
+                        self.message.clear();
+                    }
+                    Err(e) => {
+                        self.set_message(MsgKind::Error, format!("Region capture failed: {e:#}"))
+                    }
                 }
-                Err(e) => self.set_message(MsgKind::Error, format!("Region capture failed: {e:#}")),
             }
         }
 
@@ -284,9 +297,13 @@ impl eframe::App for ScreenshotDaiApp {
         // quitting is only via the tray Quit item.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested {
-            // Tell eframe to cancel the close, then hide instead.
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(&ctx);
+            if self.quitting {
+                // Tray Quit: let the close proceed so eframe exits.
+            } else {
+                // Settings-window X: hide instead of quitting.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_window(&ctx);
+            }
         }
 
         // When hidden, draw nothing else.
