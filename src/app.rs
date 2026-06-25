@@ -1,9 +1,13 @@
 //! eframe app: main window with capture + settings UI.
 
+use std::sync::{Arc, Mutex};
+
 use eframe::egui;
+use image::RgbaImage;
 
 use crate::capture;
 use crate::config::Settings;
+use crate::ui::pin_window::PinSession;
 
 /// Top-level application state carried across frames.
 pub struct ScreenshotDaiApp {
@@ -15,8 +19,13 @@ pub struct ScreenshotDaiApp {
     /// Status / message line shown to the user.
     message: String,
     /// Active region-selection overlay session, if any.
-    region_session:
-        Option<std::sync::Arc<std::sync::Mutex<crate::ui::region_overlay::RegionSession>>>,
+    region_session: Option<Arc<Mutex<crate::ui::region_overlay::RegionSession>>>,
+    /// Most recent capture (fullscreen OR region), used for "Pin to desktop".
+    last_image: Option<RgbaImage>,
+    /// Active pinned-screenshot sessions.
+    pins: Vec<Arc<Mutex<PinSession>>>,
+    /// Counter for unique stable pin ids.
+    next_pin_id: u64,
 }
 
 impl ScreenshotDaiApp {
@@ -28,6 +37,9 @@ impl ScreenshotDaiApp {
             texture: None,
             message: String::new(),
             region_session: None,
+            last_image: None,
+            pins: Vec::new(),
+            next_pin_id: 0,
         }
     }
 }
@@ -55,6 +67,7 @@ impl eframe::App for ScreenshotDaiApp {
                                         egui::TextureOptions::LINEAR,
                                     );
                                     self.texture = Some(handle);
+                                    self.last_image = Some(img.clone());
                                 }
                                 Err(e) => {
                                     self.message = format!("Save failed: {e:#}");
@@ -70,11 +83,30 @@ impl eframe::App for ScreenshotDaiApp {
                 if ui.button("Capture Region").clicked() {
                     match crate::ui::region_overlay::start_session(ui.ctx()) {
                         Ok(s) => {
-                            self.region_session =
-                                Some(std::sync::Arc::new(std::sync::Mutex::new(s)));
+                            self.region_session = Some(Arc::new(Mutex::new(s)));
                             self.message.clear();
                         }
                         Err(e) => self.message = format!("Region capture failed: {e:#}"),
+                    }
+                }
+
+                if ui
+                    .add_enabled(
+                        self.last_image.is_some(),
+                        egui::Button::new("Pin to desktop"),
+                    )
+                    .clicked()
+                {
+                    if let Some(img) = &self.last_image {
+                        self.next_pin_id += 1;
+                        let id = self.next_pin_id;
+                        let scale = crate::capture::primary_monitor()
+                            .ok()
+                            .and_then(|m| m.scale_factor().ok())
+                            .unwrap_or(1.0);
+                        let session =
+                            crate::ui::pin_window::PinSession::new(ui.ctx(), id, img, scale);
+                        self.pins.push(Arc::new(Mutex::new(session)));
                     }
                 }
             });
@@ -121,6 +153,7 @@ impl eframe::App for ScreenshotDaiApp {
                                 ci,
                                 egui::TextureOptions::LINEAR,
                             ));
+                            self.last_image = Some(img);
                         }
                         Some(crate::ui::region_overlay::RegionResult::Cancelled) => {
                             new_message = Some("Region capture cancelled.".to_string());
@@ -140,6 +173,12 @@ impl eframe::App for ScreenshotDaiApp {
             if let Some(m) = new_message {
                 self.message = m;
             }
+
+            // Show + reap pinned windows.
+            for session in &self.pins {
+                crate::ui::pin_window::show_pin(ui.ctx(), session);
+            }
+            self.pins.retain(|s| !s.lock().expect("poisoned").closed);
 
             if !self.message.is_empty() {
                 ui.label(&self.message);
