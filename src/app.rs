@@ -133,18 +133,27 @@ impl ScreenshotDaiApp {
             })
             .ok();
         if let Some(gm) = &hotkey_manager {
-            let combo = format!(
-                "{}+{}",
-                settings.hotkey_modifiers.trim(),
-                settings.hotkey_key.trim()
-            );
+            let mods = settings.hotkey_modifiers.trim();
+            let key = settings.hotkey_key.trim();
+            // A modifier-less global hotkey (e.g. "S") is valid and parses fine,
+            // but it will swallow that key system-wide while the app runs, so a
+            // user who clears the modifiers field does so deliberately.
+            let combo = if mods.is_empty() {
+                key.to_string()
+            } else {
+                format!("{mods}+{key}")
+            };
             let fallback = || HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
             let hk = match HotKey::from_str(&combo) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to parse configured hotkey {combo:?}: {e}; using Ctrl+Shift+S"
-                    );
+                    if key.is_empty() {
+                        tracing::info!("no hotkey key configured; using Ctrl+Shift+S");
+                    } else {
+                        tracing::warn!(
+                            "failed to parse configured hotkey {combo:?}: {e}; using Ctrl+Shift+S"
+                        );
+                    }
                     fallback()
                 }
             };

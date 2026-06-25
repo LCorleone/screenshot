@@ -261,7 +261,10 @@ impl RegionSession {
         let anchor = self.text_anchor;
         let drect = self.doc_rect;
         let scale = self.scale;
-        let scale_i = (scale.round() as i32).max(1);
+        // 2x round(scale): at 100% DPI this yields 10x14 glyphs (vs the 5x7
+        // the raw scale gave), closer to the ~13pt live TextEdit preview.
+        // Min 2 for legibility. The 5x7 FONT TABLE itself is unchanged.
+        let scale_i = ((scale * 2.0).round() as i32).max(2);
         let buf = self.text_buf.trim().to_string();
         let base = self.doc.clone();
         if let (Some(anchor), Some(drect), Some(base)) = (anchor, drect, base) {
@@ -407,6 +410,12 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     let painter = ui.painter().clone();
     let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
+    // The Edit-phase doc canvas is registered as an interactable widget so the
+    // foreground toolbar/text Areas (shown below) consume clicks first and the
+    // canvas only receives clicks that land on the doc itself. Captured here in
+    // the paint pass (outside the session lock) and reused by the input pass.
+    let mut canvas_resp: Option<egui::Response> = None;
+
     // --- PAINT ---
     match r.phase {
         Phase::Select => {
@@ -484,6 +493,19 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                     }
                 }
                 Tool::None | Tool::Text => {}
+            }
+
+            // Capture the canvas interaction (Edit-phase only) so the input
+            // pass can gate presses/drags on it. The toolbar + text Areas
+            // rendered below are `Order::Foreground`, so egui routes any
+            // overlapping click to them first; the canvas never sees toolbar
+            // clicks → no spurious text box / tool drag from a toolbar click.
+            if let Some(drect) = r.doc_rect {
+                canvas_resp = Some(ui.interact(
+                    drect,
+                    egui::Id::new("editor_canvas"),
+                    egui::Sense::click_and_drag(),
+                ));
             }
         }
     }
@@ -607,18 +629,29 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     // --- INPUT PASS (mutable) ---
     // Read raw pointer/key state WITHOUT the session lock, so the lock is held
     // only briefly while mutating.
-    let (primary_down, primary_pressed, latest, esc, enter, released, close_requested) =
-        ctx.input(|i| {
-            (
-                i.pointer.primary_down(),
-                i.pointer.primary_pressed(),
-                i.pointer.latest_pos(),
-                i.key_pressed(Key::Escape),
-                i.key_pressed(Key::Enter),
-                i.pointer.primary_released(),
-                i.viewport().close_requested(),
-            )
-        });
+    let (primary_down, latest, esc, enter, released, close_requested) = ctx.input(|i| {
+        (
+            i.pointer.primary_down(),
+            i.pointer.latest_pos(),
+            i.key_pressed(Key::Escape),
+            i.key_pressed(Key::Enter),
+            i.pointer.primary_released(),
+            i.viewport().close_requested(),
+        )
+    });
+
+    // Edit-phase pointer triggers gated on the canvas Response, so clicks the
+    // foreground toolbar/text Areas consumed don't start a tool drag or place a
+    // text box. Select-phase keeps the raw pointer (it needs the full screen).
+    let canvas_clicked_primary = canvas_resp
+        .as_ref()
+        .map(|r| r.clicked_by(egui::PointerButton::Primary))
+        .unwrap_or(false);
+    let canvas_is_down = canvas_resp.as_ref().map(|r| r.dragged()).unwrap_or(false);
+    let canvas_released = canvas_resp
+        .as_ref()
+        .map(|r| r.drag_stopped())
+        .unwrap_or(false);
 
     let mut g = session.lock().expect("region session poisoned");
     if g.finished {
@@ -797,7 +830,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                 }
                 Tool::Rect | Tool::Arrow => {
                     if let Some(drect) = g.doc_rect {
-                        if primary_down {
+                        if canvas_is_down {
                             if let Some(p) = latest {
                                 if drect.contains(p) {
                                     if g.tool_drag_start.is_none() {
@@ -806,7 +839,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                     g.tool_drag_cur = Some(p);
                                 }
                             }
-                        } else if released {
+                        } else if canvas_released {
                             if let (Some(ds), Some(dc)) = (g.tool_drag_start, g.tool_drag_cur) {
                                 let drag = (dc.x - ds.x).abs() > MIN_DRAG
                                     && (dc.y - ds.y).abs() > MIN_DRAG;
@@ -833,7 +866,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                 }
                 Tool::Pencil => {
                     if let Some(drect) = g.doc_rect {
-                        if primary_down {
+                        if canvas_is_down {
                             if let Some(p) = latest {
                                 if drect.contains(p) {
                                     if g.pencil_points.is_empty() {
@@ -846,14 +879,14 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                     }
                                 }
                             }
-                        } else if released && g.pencil_points.len() >= 2 {
+                        } else if canvas_released && g.pencil_points.len() >= 2 {
                             if let Some(base) = g.doc.clone() {
                                 let mut nd = base;
                                 rasterize_pencil(&mut nd, drect.min, &g.pencil_points, g.scale);
                                 g.commit_doc(&ctx, nd);
                             }
                             g.pencil_points.clear();
-                        } else if released {
+                        } else if canvas_released {
                             // A tap without movement: ignore (no commit).
                             g.pencil_points.clear();
                         }
@@ -867,7 +900,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             // natural "click to place the next one" behavior.)
             if g.active_tool == Tool::Text {
                 if let Some(drect) = g.doc_rect {
-                    if !g.text_editing && primary_pressed {
+                    if !g.text_editing && canvas_clicked_primary {
                         if let Some(p) = latest {
                             if drect.contains(p) {
                                 g.text_anchor = Some(p);
@@ -1033,8 +1066,8 @@ fn rasterize_arrow(
     rasterize_thick_line(doc, x0, y0, x1, y1, t_dark, STROKE_DARK);
     rasterize_thick_line(doc, x0, y0, x1, y1, t_white, STROKE_WHITE);
     // Head at the tip (x1,y1); "base" direction is back toward (x0,y0).
-    rasterize_arrowhead(doc, x1, y1, x0, y0, t_dark, STROKE_DARK);
-    rasterize_arrowhead(doc, x1, y1, x0, y0, t_white, STROKE_WHITE);
+    rasterize_arrowhead(doc, x1, y1, x0, y0, t_dark, STROKE_DARK, scale);
+    rasterize_arrowhead(doc, x1, y1, x0, y0, t_white, STROKE_WHITE, scale);
 }
 
 /// Rasterize a freehand polyline (the Pencil commit core). Dark backing then
@@ -1108,7 +1141,8 @@ fn stamp_square(img: &mut RgbaImage, cx: i32, cy: i32, thickness: i32, px: image
 /// Rasterize an arrowhead at the tip `(tip_x, tip_y)`: two short thick barbs
 /// pointing back toward `(base_x, base_y)` at ±~30° off the shaft. Reuses
 /// [`rasterize_thick_line`] for each barb so it shares the dark/white pass
-/// treatment. Head length ~12 physical px (clamped to the shaft length).
+/// treatment. Head length is `12 * scale` physical px (matching the 12-logical
+/// px live preview), clamped to `[1, shaft_length]`.
 fn rasterize_arrowhead(
     doc: &mut RgbaImage,
     tip_x: i32,
@@ -1117,6 +1151,7 @@ fn rasterize_arrowhead(
     base_y: i32,
     thickness: i32,
     color: [u8; 4],
+    scale: f32,
 ) {
     let dx = (base_x - tip_x) as f32;
     let dy = (base_y - tip_y) as f32;
@@ -1129,7 +1164,7 @@ fn rasterize_arrowhead(
     // Perpendicular to the shaft.
     let perp_x = -uy;
     let perp_y = ux;
-    let head_len = (12.0_f32).min(len);
+    let head_len = (12.0_f32 * scale).min(len).max(1.0);
     let cos_a = (30.0_f32).to_radians().cos();
     let sin_a = (30.0_f32).to_radians().sin();
     for sign in [-1.0_f32, 1.0] {
