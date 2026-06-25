@@ -5,11 +5,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod capture;
 mod clipboard;
 mod config;
-mod capture;
 mod llm;
 mod ocr;
+mod platform;
 mod ui;
 
 use eframe::egui;

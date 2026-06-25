@@ -34,6 +34,8 @@ pub struct RegionSession {
     pub drag_start: Option<Pos2>,
     /// Current pointer in logical overlay coords while dragging.
     pub drag_cur: Option<Pos2>,
+    /// Hover-snap rect (logical) updated each frame while not dragging.
+    pub hover_rect: Option<Rect>,
     /// Set when the session is done.
     pub finished: bool,
     /// Result once finished.
@@ -51,6 +53,7 @@ impl RegionSession {
             size_logical,
             drag_start: None,
             drag_cur: None,
+            hover_rect: None,
             finished: false,
             result: None,
         }
@@ -84,15 +87,27 @@ pub fn start_session(ctx: &egui::Context) -> anyhow::Result<RegionSession> {
 pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     let screen = ui.ctx().content_rect();
 
-    // Read-only pass: gather what we need to paint.
-    let (tex_id, image_px, scale, cur_sel) = {
-        let g = session.lock().expect("region session poisoned");
+    // Read-only pass: gather what we need to paint. Also update the live
+    // hover-snap rect while the user is NOT dragging.
+    let (tex_id, image_px, scale, cur_sel, hover_rect) = {
+        let mut g = session.lock().expect("region session poisoned");
+        // Hover-snap is only live before a drag begins.
+        let hr = if g.drag_start.is_none() {
+            let pos = ui.ctx().input(|i| i.pointer.latest_pos());
+            pos.and_then(|p| {
+                crate::platform::window_rect_at((p.x, p.y))
+                    .map(|(x, y, w, h)| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)))
+            })
+        } else {
+            None
+        };
+        g.hover_rect = hr;
         let id = g
             .texture
             .as_ref()
             .map(|t| t.id())
             .unwrap_or(egui::TextureId::Managed(0));
-        (id, g.image_px, g.scale, g.current_rect())
+        (id, g.image_px, g.scale, g.current_rect(), hr)
     };
 
     let painter = ui.painter().clone();
@@ -107,16 +122,20 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     // 2. dim everything
     painter.rect_filled(screen, 0.0, Color32::from_black_alpha(140));
 
-    // 3. spotlight + label
-    if let Some(sel) = cur_sel {
+    // 3. spotlight + label. While not dragging, a live hover-snap rect
+    //    (if any) acts as the preview selection.
+    let preview = cur_sel.or(hover_rect);
+    if let Some(sel) = preview {
         let uv = to_uv(sel, screen.min, scale, image_px);
         painter.image(tex_id, sel, uv, Color32::WHITE);
-        painter.rect_stroke(
-            sel,
-            0.0,
-            Stroke::new(2.0, Color32::WHITE),
-            egui::epaint::StrokeKind::Inside,
-        );
+        // Active drag selection gets a white border; a pure hover preview
+        // gets a softer accent border to signal it isn't confirmed yet.
+        let stroke = if cur_sel.is_some() {
+            Stroke::new(2.0, Color32::WHITE)
+        } else {
+            Stroke::new(2.0, Color32::from_rgb(120, 180, 255))
+        };
+        painter.rect_stroke(sel, 0.0, stroke, egui::epaint::StrokeKind::Inside);
         let pw = ((sel.max.x - sel.min.x) * scale).round() as i32;
         let ph = ((sel.max.y - sel.min.y) * scale).round() as i32;
         painter.debug_text(
@@ -130,7 +149,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             screen.center(),
             Align2::CENTER_CENTER,
             Color32::WHITE,
-            "Drag to select · Esc to cancel",
+            "Drag to select · click a window to snap · Esc to cancel",
         );
     }
 
@@ -175,8 +194,13 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
         }
         g.drag_cur = latest;
     } else if released {
-        if let Some(r) = g.current_rect() {
-            if (r.max.x - r.min.x).abs() > MIN_DRAG && (r.max.y - r.min.y).abs() > MIN_DRAG {
+        let dragged = g
+            .current_rect()
+            .map(|r| (r.max.x - r.min.x).abs() > MIN_DRAG && (r.max.y - r.min.y).abs() > MIN_DRAG)
+            .unwrap_or(false);
+        if dragged {
+            // Free-form drag selection: confirm on release.
+            if let Some(r) = g.current_rect() {
                 if let Some(cropped) = crop(&g.full_image, r, screen.min, g.scale) {
                     g.finished = true;
                     g.result = Some(RegionResult::Cropped(cropped));
@@ -184,6 +208,15 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                     g.drag_cur = None;
                     return;
                 }
+            }
+        } else if let Some(hr) = g.hover_rect {
+            // Click without a drag: snap-to-confirm the live hover rect.
+            if let Some(cropped) = crop(&g.full_image, hr, screen.min, g.scale) {
+                g.finished = true;
+                g.result = Some(RegionResult::Cropped(cropped));
+                g.drag_start = None;
+                g.drag_cur = None;
+                return;
             }
         }
         g.drag_start = None;
