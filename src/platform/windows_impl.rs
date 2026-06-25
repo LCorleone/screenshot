@@ -5,14 +5,14 @@
 //! occlude every other window for `WindowFromPoint`. Enumerating top-level
 //! windows and hit-testing their rects against the cursor avoids that.
 //!
-//! All public inputs/outputs are in **logical screen points** (the same
-//! coordinate space the egui overlay uses). Internally we convert to/from
-//! physical pixels using the system DPI.
+//! All public inputs/outputs are in the overlay's **logical points** space
+//! (origin = the overlay's top-left), with `origin_physical` providing the
+//! offset from overlay-local to absolute virtual-screen physical px (= `vmin`).
+//! `scale` is the primary monitor's scale factor (uniform-DPI assumption).
 
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowTextW, IsIconic, IsWindowVisible,
+    EnumWindows, GetCursorPos, GetWindowRect, GetWindowTextW, IsIconic, IsWindowVisible,
 };
 use windows::core::BOOL;
 
@@ -27,27 +27,37 @@ impl Collector {
     }
 }
 
-/// Returns the rect `(x, y, w, h)` in **logical screen points** of the
-/// topmost/most-specific window under `screen_pt_logical`, or `None` if the
-/// cursor isn't inside any candidate window. Never panics.
-pub fn window_rect_at(screen_pt_logical: (f32, f32)) -> Option<(f32, f32, f32, f32)> {
-    // System DPI scale (logical = physical / scale). Per-monitor DPI is assumed
-    // uniform for v1; if we cannot read it, fall back to 1.0.
-    let scale: f32 = match unsafe { GetDpiForSystem() } {
-        dpi if dpi > 0 => dpi as f32 / 96.0,
-        _ => {
-            tracing::warn!("GetDpiForSystem returned 0; assuming scale 1.0");
-            1.0
-        }
-    };
+/// Physical screen coordinates of the OS cursor (virtual-screen space), or None.
+pub fn cursor_screen_physical() -> Option<(i32, i32)> {
+    let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: out-pointer is valid.
+    if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+        Some((pt.x, pt.y))
+    } else {
+        None
+    }
+}
+
+/// Returns the rect `(x, y, w, h)` of the topmost/most-specific window under
+/// `local_pt_logical`, expressed in the SAME overlay-local logical space as
+/// the input (i.e. the window's physical screen rect converted back to the
+/// overlay's coordinate frame). `origin_physical` is the overlay's top-left in
+/// physical virtual-screen pixels (= `vmin`), and `scale` is physical px per
+/// logical point (primary monitor's scale factor; uniform-DPI assumption).
+/// Returns `None` if the cursor isn't inside any candidate window. Never panics.
+pub fn window_rect_at(
+    local_pt_logical: (f32, f32),
+    origin_physical: (i32, i32),
+    scale: f32,
+) -> Option<(f32, f32, f32, f32)> {
     if !scale.is_finite() || scale <= 0.0 {
-        tracing::warn!("invalid system DPI scale ({scale}); assuming 1.0");
+        tracing::warn!("invalid scale ({scale}) in window_rect_at; assuming 1.0");
         return None;
     }
 
-    // Cursor in physical screen pixels.
-    let cx = (screen_pt_logical.0 * scale).round() as i32;
-    let cy = (screen_pt_logical.1 * scale).round() as i32;
+    // Input: overlay-local logical → physical virtual-screen px.
+    let cx = (local_pt_logical.0 * scale).round() as i32 + origin_physical.0;
+    let cy = (local_pt_logical.1 * scale).round() as i32 + origin_physical.1;
 
     // Gather visible, non-minimized top-level window rects (physical px).
     let mut collector = Collector::new();
@@ -72,9 +82,17 @@ pub fn window_rect_at(screen_pt_logical: (f32, f32)) -> Option<(f32, f32, f32, f
     }
 
     let (l, t, r, b) = best?;
-    let (x, y) = (l as f32 / scale, t as f32 / scale);
-    let (w, h) = ((r - l) as f32 / scale, (b - t) as f32 / scale);
-    tracing::trace!("window_rect_at: hover rect=({x:.1},{y:.1},{w:.1},{h:.1}) scale={scale:.2}");
+    // Output: physical virtual-screen px → overlay-local logical. Subtract the
+    // overlay's physical origin first, then divide by scale. This is the
+    // symmetric inverse of the input conversion above.
+    let x = ((l - origin_physical.0) as f32) / scale;
+    let y = ((t - origin_physical.1) as f32) / scale;
+    let w = ((r - l) as f32) / scale;
+    let h = ((b - t) as f32) / scale;
+    tracing::trace!(
+        "window_rect_at: hover rect=({x:.1},{y:.1},{w:.1},{h:.1}) scale={scale:.2} origin=({:?})",
+        origin_physical
+    );
     Some((x, y, w, h))
 }
 

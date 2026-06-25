@@ -1,5 +1,9 @@
-//! Region-selection overlay: a frozen snapshot of the primary monitor with a
-//! draggable crop box. Esc cancels; mouse-up or Enter confirms.
+//! Region-selection overlay: a frozen snapshot of the whole virtual desktop
+//! (all monitors) with a draggable crop box. Esc cancels; mouse-up or Enter
+//! confirms. The overlay window is positioned at the virtual-screen top-left
+//! (`vmin`, possibly negative) and sized to cover the entire virtual desktop,
+//! so the existing crop/to_uv math (offset-from-origin) is already correct for
+//! the composite image.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,16 +24,20 @@ pub enum RegionResult {
 
 /// Shared state between the main app and the overlay viewport.
 pub struct RegionSession {
-    /// Full primary-monitor screenshot.
+    /// Full virtual-desktop composite screenshot (origin = `origin_physical`).
     pub full_image: RgbaImage,
     /// egui texture over `full_image`, kept alive here.
     pub texture: Option<egui::TextureHandle>,
     /// Image dims in physical pixels.
     pub image_px: [usize; 2],
-    /// Physical pixels per logical point (monitor scale factor).
+    /// Physical pixels per logical point (primary monitor scale factor;
+    /// uniform-DPI assumption for the whole virtual desktop).
     pub scale: f32,
-    /// Logical on-screen size of the overlay (= monitor in logical points).
+    /// Logical on-screen size of the overlay (= virtual desktop in logical pts).
     pub size_logical: Vec2,
+    /// Overlay's top-left in physical virtual-screen pixels (= `vmin`).
+    /// (0,0) for a single primary monitor; may be negative on multi-monitor.
+    pub origin_physical: (i32, i32),
     /// Drag origin in logical overlay coords while dragging.
     pub drag_start: Option<Pos2>,
     /// Current pointer in logical overlay coords while dragging.
@@ -51,6 +59,7 @@ impl RegionSession {
             image_px,
             scale,
             size_logical,
+            origin_physical: (0, 0),
             drag_start: None,
             drag_cur: None,
             hover_rect: None,
@@ -68,15 +77,21 @@ impl RegionSession {
     }
 }
 
-/// Capture the primary monitor and build a ready-to-show session.
+/// Capture the full virtual desktop and build a ready-to-show session.
 pub fn start_session(ctx: &egui::Context) -> anyhow::Result<RegionSession> {
-    let mon = crate::capture::primary_monitor()?;
-    let scale = mon.scale_factor().unwrap_or(1.0).max(0.0001);
-    let w_px = mon.width().unwrap_or(0) as f32;
-    let h_px = mon.height().unwrap_or(0) as f32;
-    let img = mon.capture_image()?;
-    let size_logical = Vec2::new(w_px / scale, h_px / scale);
+    let (img, vmin, vsize) = crate::capture::capture_virtual_desktop()?;
+    // scale = primary monitor's scale factor (uniform-DPI assumption).
+    let scale = crate::capture::primary_monitor()
+        .ok()
+        .and_then(|m| m.scale_factor().ok())
+        .unwrap_or(1.0)
+        .max(0.0001);
+    let size_logical = Vec2::new(
+        (vsize.0 as f32 / scale).max(1.0),
+        (vsize.1 as f32 / scale).max(1.0),
+    );
     let mut session = RegionSession::new(img, scale, size_logical);
+    session.origin_physical = vmin;
     let color_image = crate::capture::rgba_image_to_color_image(&session.full_image);
     let handle = ctx.load_texture("region-bg", color_image, egui::TextureOptions::LINEAR);
     session.texture = Some(handle);
@@ -95,7 +110,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
         let hr = if g.drag_start.is_none() {
             let pos = ui.ctx().input(|i| i.pointer.latest_pos());
             pos.and_then(|p| {
-                crate::platform::window_rect_at((p.x, p.y))
+                crate::platform::window_rect_at((p.x, p.y), g.origin_physical, g.scale)
                     .map(|(x, y, w, h)| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)))
             })
         } else {
@@ -214,7 +229,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             // release. Recompute fresh — `g.hover_rect` is stale by this frame
             // (the read pass clears it once drag_start became Some on press).
             let hr = latest.and_then(|p| {
-                crate::platform::window_rect_at((p.x, p.y))
+                crate::platform::window_rect_at((p.x, p.y), g.origin_physical, g.scale)
                     .map(|(x, y, w, h)| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)))
             });
             if let Some(hr) = hr {

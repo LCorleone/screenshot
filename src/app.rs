@@ -22,6 +22,9 @@ pub struct ScreenshotDaiApp {
     region_session: Option<Arc<Mutex<crate::ui::region_overlay::RegionSession>>>,
     /// Most recent capture (fullscreen OR region), used for "Pin to desktop".
     last_image: Option<RgbaImage>,
+    /// Physical px / logical point for `last_image` (the capturing monitor's
+    /// scale factor). Used to size pinned windows correctly.
+    last_scale: f32,
     /// Active pinned-screenshot sessions.
     pins: Vec<Arc<Mutex<PinSession>>>,
     /// Counter for unique stable pin ids.
@@ -38,6 +41,7 @@ impl ScreenshotDaiApp {
             message: String::new(),
             region_session: None,
             last_image: None,
+            last_scale: 1.0,
             pins: Vec::new(),
             next_pin_id: 0,
         }
@@ -54,8 +58,8 @@ impl eframe::App for ScreenshotDaiApp {
             ui.horizontal(|ui| {
                 if ui.button("Capture Fullscreen").clicked() {
                     self.message.clear();
-                    match capture::capture_primary_monitor() {
-                        Ok(img) => {
+                    match capture::capture_monitor_under_cursor() {
+                        Ok((img, scale)) => {
                             let path = capture::default_save_path();
                             match capture::save_png(&path, &img) {
                                 Ok(()) => {
@@ -68,6 +72,7 @@ impl eframe::App for ScreenshotDaiApp {
                                     );
                                     self.texture = Some(handle);
                                     self.last_image = Some(img.clone());
+                                    self.last_scale = scale;
                                 }
                                 Err(e) => {
                                     self.message = format!("Save failed: {e:#}");
@@ -100,10 +105,7 @@ impl eframe::App for ScreenshotDaiApp {
                     if let Some(img) = &self.last_image {
                         self.next_pin_id += 1;
                         let id = self.next_pin_id;
-                        let scale = crate::capture::primary_monitor()
-                            .ok()
-                            .and_then(|m| m.scale_factor().ok())
-                            .unwrap_or(1.0);
+                        let scale = self.last_scale;
                         let session =
                             crate::ui::pin_window::PinSession::new(ui.ctx(), id, img, scale);
                         self.pins.push(Arc::new(Mutex::new(session)));
@@ -113,14 +115,21 @@ impl eframe::App for ScreenshotDaiApp {
 
             // Show the overlay while a session is active.
             if let Some(session) = self.region_session.clone() {
-                let size_logical = session.lock().expect("poisoned").size_logical;
+                let (origin_logical, size_logical) = {
+                    let g = session.lock().expect("poisoned");
+                    let ol = egui::pos2(
+                        g.origin_physical.0 as f32 / g.scale,
+                        g.origin_physical.1 as f32 / g.scale,
+                    );
+                    (ol, g.size_logical)
+                };
                 ui.ctx().show_viewport_immediate(
                     egui::ViewportId::from_hash_of("region_overlay"),
                     egui::ViewportBuilder::default()
                         .with_decorations(false)
                         .with_resizable(false)
                         .with_always_on_top()
-                        .with_position([0.0, 0.0])
+                        .with_position([origin_logical.x, origin_logical.y])
                         .with_inner_size(size_logical)
                         .with_title("screenshot-dai region"),
                     move |ui, _class| {
@@ -132,11 +141,15 @@ impl eframe::App for ScreenshotDaiApp {
             // Harvest the result (takes the session out; restores it if not finished).
             let mut new_texture: Option<egui::TextureHandle> = None;
             let mut new_message: Option<String> = None;
+            let mut new_last_scale: Option<f32> = None;
             let taken = self.region_session.take();
             if let Some(session) = taken {
                 let finished = session.lock().expect("poisoned").finished;
                 if finished {
-                    let result = session.lock().expect("poisoned").result.take();
+                    let (result, session_scale) = {
+                        let mut g = session.lock().expect("poisoned");
+                        (g.result.take(), g.scale)
+                    };
                     match result {
                         Some(crate::ui::region_overlay::RegionResult::Cropped(img)) => {
                             let path = capture::default_save_path();
@@ -154,6 +167,7 @@ impl eframe::App for ScreenshotDaiApp {
                                 egui::TextureOptions::LINEAR,
                             ));
                             self.last_image = Some(img);
+                            new_last_scale = Some(session_scale);
                         }
                         Some(crate::ui::region_overlay::RegionResult::Cancelled) => {
                             new_message = Some("Region capture cancelled.".to_string());
@@ -172,6 +186,9 @@ impl eframe::App for ScreenshotDaiApp {
             }
             if let Some(m) = new_message {
                 self.message = m;
+            }
+            if let Some(s) = new_last_scale {
+                self.last_scale = s;
             }
 
             // Show + reap pinned windows.
