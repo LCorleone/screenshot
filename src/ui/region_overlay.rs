@@ -209,14 +209,22 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                     return;
                 }
             }
-        } else if let Some(hr) = g.hover_rect {
-            // Click without a drag: snap-to-confirm the live hover rect.
-            if let Some(cropped) = crop(&g.full_image, hr, screen.min, g.scale) {
-                g.finished = true;
-                g.result = Some(RegionResult::Cropped(cropped));
-                g.drag_start = None;
-                g.drag_cur = None;
-                return;
+        } else {
+            // Click without a drag: snap to the window under the cursor at
+            // release. Recompute fresh — `g.hover_rect` is stale by this frame
+            // (the read pass clears it once drag_start became Some on press).
+            let hr = latest.and_then(|p| {
+                crate::platform::window_rect_at((p.x, p.y))
+                    .map(|(x, y, w, h)| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)))
+            });
+            if let Some(hr) = hr {
+                if let Some(cropped) = crop(&g.full_image, hr, screen.min, g.scale) {
+                    g.finished = true;
+                    g.result = Some(RegionResult::Cropped(cropped));
+                    g.drag_start = None;
+                    g.drag_cur = None;
+                    return;
+                }
             }
         }
         g.drag_start = None;
