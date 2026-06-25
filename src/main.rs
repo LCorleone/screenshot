@@ -1,5 +1,9 @@
 //! screenshot-dai entry point.
 
+// On Windows release builds, use the GUI subsystem so no console window
+// pops up when the app is launched. Kept in debug builds for log visibility.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod clipboard;
 mod config;
