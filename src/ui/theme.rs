@@ -38,6 +38,7 @@ pub const SUCCESS: Color32 = Color32::from_rgb(0x4c, 0xe1, 0x5e);
 /// Geist `sm` — controls/buttons/inputs. `CornerRadius` uses `u8` in egui 0.34.
 pub const RADIUS_SM: u8 = 6;
 /// Geist `lg` — fullscreen surfaces (preview frame).
+#[allow(dead_code)]
 pub const RADIUS_LG: u8 = 16;
 
 /// Name of the named `FontFamily` resolving to Geist Medium (button text).
@@ -54,6 +55,7 @@ pub fn section_font() -> egui::FontId {
 }
 
 /// `FontId` for a caption (Geist Regular 12px).
+#[allow(dead_code)]
 pub fn caption_font() -> egui::FontId {
     egui::FontId::new(12.0, egui::FontFamily::Proportional)
 }

@@ -1,17 +1,20 @@
 //! eframe app: system-tray-driven capture tool with a hidden-by-default
 //! Settings window.
 //!
-//! Phase E0 behaviour:
-//! - The Settings window starts hidden; it is shown via the tray menu or after
-//!   a capture.
+//! Phase E1 behaviour:
+//! - The Settings window starts hidden; it is shown only via the tray menu.
+//!   (E0 used to auto-pop it after a capture — that stopgap is gone.)
 //! - A global hotkey (`Ctrl+Shift+S`) and the tray "Capture Region" item start
-//!   the existing region-overlay engine.
-//! - After a capture we do NOT auto-save. We hold the image in memory and show
-//!   a small preview + a "Copy" button (copies to the system clipboard via
-//!   `arboard`).
+//!   the region-overlay engine, which now flows into the in-place editor.
+//! - The editor yields an [`region_overlay::EditorOutcome`] the app harvests:
+//!   `Pin` floats the edited image as a pinned window, `Save` opens an rfd
+//!   save dialog and writes a PNG, `Copy` copies to the clipboard, `Cancel`
+//!   does nothing.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use eframe::egui;
 use global_hotkey::GlobalHotKeyEvent;
 use global_hotkey::GlobalHotKeyManager;
@@ -21,6 +24,7 @@ use tray_icon::TrayIcon;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 use crate::config::Settings;
+use crate::ui::pin_window;
 use crate::ui::region_overlay;
 
 /// Visual classification of the status message, so its color doesn't depend on
@@ -41,23 +45,21 @@ pub struct ScreenshotDaiApp {
     message: String,
     /// Visual classification of `message`.
     message_kind: MsgKind,
-    /// Texture handle for the most recent capture preview (in-window thumbnail).
-    texture: Option<egui::TextureHandle>,
     /// Active region-selection overlay session, if any.
     region_session: Option<Arc<Mutex<region_overlay::RegionSession>>>,
-    /// Most recent capture (kept in memory; never auto-saved in E0).
-    last_image: Option<RgbaImage>,
-    /// Physical px / logical point for `last_image` (the capturing monitor's
-    /// scale factor). Retained for later phases that reintroduce the pin.
+    /// Physical px / logical point of the active capture (the capturing
+    /// monitor's scale factor). Used to size pinned windows.
     last_scale: f32,
     /// Whether the Settings window should currently be visible.
     window_visible: bool,
-    /// The most recent capture, shown transiently with a Copy button.
-    just_captured: Option<RgbaImage>,
     /// Set (hotkey / tray) when a region capture has been requested but not
     /// yet started. Captures must start from within `ui()` where we have the
     /// egui ctx, so the global channel handlers just flip this flag.
     capture_requested: bool,
+    /// Floating pinned-screenshot windows created via the editor's Pin action.
+    pins: Vec<Arc<Mutex<pin_window::PinSession>>>,
+    /// Monotonic id source for the next pin window.
+    next_pin_id: u64,
 
     // --- Owned system-tray / global-hotkey state. These live as long as the
     //     App, which lives as long as eframe. Dropping them would unregister
@@ -134,13 +136,12 @@ impl ScreenshotDaiApp {
             settings_buf,
             message: String::new(),
             message_kind: MsgKind::Info,
-            texture: None,
             region_session: None,
-            last_image: None,
             last_scale: 1.0,
             window_visible: false,
-            just_captured: None,
             capture_requested: false,
+            pins: Vec::new(),
+            next_pin_id: 0,
             tray,
             settings_item,
             capture_item,
@@ -226,56 +227,59 @@ impl eframe::App for ScreenshotDaiApp {
             );
         }
 
-        // --- 5. Harvest the region result (no auto-save in E0). ---
-        let mut new_texture: Option<egui::TextureHandle> = None;
-        let mut new_message: Option<(MsgKind, String)> = None;
-        let mut new_last_scale: Option<f32> = None;
-        let mut new_captured: Option<RgbaImage> = None;
-        let taken = self.region_session.take();
-        if let Some(session) = taken {
+        // --- 5. Harvest the editor outcome. ---
+        if let Some(session) = self.region_session.take() {
             let finished = session.lock().expect("poisoned").finished;
             if finished {
                 let (result, session_scale) = {
                     let mut g = session.lock().expect("poisoned");
                     (g.result.take(), g.scale)
                 };
+                self.last_scale = session_scale;
                 match result {
-                    Some(region_overlay::RegionResult::Cropped(img)) => {
-                        let ci = crate::capture::rgba_image_to_color_image(&img);
-                        new_texture =
-                            Some(ctx.load_texture("captured", ci, egui::TextureOptions::LINEAR));
-                        new_captured = Some(img.clone());
-                        self.last_image = Some(img);
-                        new_last_scale = Some(session_scale);
-                        new_message = Some((MsgKind::Info, "Captured. Copy or close.".to_string()));
-                        self.show_window(&ctx);
+                    Some(region_overlay::EditorOutcome::Pin(img)) => {
+                        let id = self.next_pin_id;
+                        self.next_pin_id += 1;
+                        let pin = Arc::new(Mutex::new(pin_window::PinSession::new(
+                            &ctx,
+                            id,
+                            &img,
+                            session_scale,
+                        )));
+                        self.pins.push(pin);
+                        self.set_message(MsgKind::Info, "Pinned.");
                     }
-                    Some(region_overlay::RegionResult::Cancelled) => {
-                        new_message = Some((MsgKind::Info, "Capture cancelled.".to_string()));
+                    Some(region_overlay::EditorOutcome::Save(img)) => match save_via_dialog(&img) {
+                        Ok(Some(p)) => {
+                            self.set_message(MsgKind::Success, format!("Saved to {}", p.display()))
+                        }
+                        Ok(None) => self.set_message(MsgKind::Info, "Save cancelled"),
+                        Err(e) => self.set_message(MsgKind::Error, format!("Save failed: {e:#}")),
+                    },
+                    Some(region_overlay::EditorOutcome::Copy(img)) => {
+                        match copy_image_to_clipboard(&img) {
+                            Ok(()) => self.set_message(MsgKind::Success, "Copied to clipboard"),
+                            Err(e) => {
+                                self.set_message(MsgKind::Error, format!("Copy failed: {e:#}"))
+                            }
+                        }
                     }
-                    None => {
-                        // finished flag set without a result — keep the session alive defensively
-                        self.region_session = Some(session);
+                    Some(region_overlay::EditorOutcome::Cancel) | None => {
+                        self.set_message(MsgKind::Info, "Capture cancelled.");
                     }
                 }
             } else {
                 self.region_session = Some(session);
             }
         }
-        if let Some(h) = new_texture {
-            self.texture = Some(h);
-        }
-        if let Some((kind, m)) = new_message {
-            self.set_message(kind, m);
-        }
-        if let Some(s) = new_last_scale {
-            self.last_scale = s;
-        }
-        if let Some(img) = new_captured {
-            self.just_captured = Some(img);
+
+        // --- 6. Show pinned screenshots, then reap closed ones. ---
+        self.pins.retain(|p| !p.lock().expect("poisoned").closed);
+        for pin in &self.pins {
+            pin_window::show_pin(&ctx, pin);
         }
 
-        // --- 6. Window visibility + close handling. ---
+        // --- 7. Window visibility + close handling. ---
         // On OS close-request of the Settings window, HIDE (don't quit) —
         // quitting is only via the tray Quit item.
         let close_requested = ctx.input(|i| i.viewport().close_requested());
@@ -290,54 +294,10 @@ impl eframe::App for ScreenshotDaiApp {
             return;
         }
 
-        // --- 7. Draw the Settings window contents. ---
+        // --- 8. Draw the Settings window contents. ---
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("screenshot-dai Settings");
             ui.add_space(8.0);
-
-            // --- Just-captured preview + Copy button (transient, post-capture). ---
-            if self.just_captured.is_some() {
-                egui::Frame::group(ui.style())
-                    .fill(crate::ui::theme::SURFACE)
-                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::BORDER))
-                    .corner_radius(egui::CornerRadius::same(crate::ui::theme::RADIUS_LG))
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Most Recent Capture")
-                                .font(crate::ui::theme::caption_font())
-                                .color(crate::ui::theme::TEXT_SECONDARY),
-                        );
-                        if let Some(handle) = &self.texture {
-                            let avail = ui.available_width();
-                            let size = handle.size_vec2();
-                            let scale = if size.x > 0.0 {
-                                (avail / size.x).min(1.0)
-                            } else {
-                                1.0
-                            };
-                            // Cap the preview height at ~200 logical points.
-                            let scaled = size * scale;
-                            let height_cap = scaled.y.min(200.0);
-                            let width_cap = scaled.x * (height_cap / scaled.y.max(1.0));
-                            ui.image(egui::load::SizedTexture::new(
-                                handle.id(),
-                                egui::vec2(width_cap, height_cap),
-                            ));
-                        }
-                        if ui.add(crate::ui::theme::secondary_button("Copy")).clicked() {
-                            match copy_image_to_clipboard(self.last_image.as_ref()) {
-                                Ok(()) => self.set_message(MsgKind::Success, "Copied to clipboard"),
-                                Err(e) => {
-                                    self.set_message(MsgKind::Error, format!("Copy failed: {e:#}"))
-                                }
-                            }
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-            }
 
             // --- Settings form ---
             egui::Grid::new("settings_grid")
@@ -419,8 +379,7 @@ impl eframe::App for ScreenshotDaiApp {
 ///
 /// arboard 3.x exposes `ImageData { width, height, bytes }` (no `from_rgba`);
 /// we build it directly from the image's raw RGBA bytes.
-fn copy_image_to_clipboard(img: Option<&RgbaImage>) -> anyhow::Result<()> {
-    let img = img.ok_or_else(|| anyhow::anyhow!("no captured image to copy"))?;
+fn copy_image_to_clipboard(img: &RgbaImage) -> anyhow::Result<()> {
     let mut cb = arboard::Clipboard::new()?;
     let data = arboard::ImageData {
         width: img.width() as usize,
@@ -429,4 +388,32 @@ fn copy_image_to_clipboard(img: Option<&RgbaImage>) -> anyhow::Result<()> {
     };
     cb.set_image(data.to_owned_img())?;
     Ok(())
+}
+
+/// Open a native "Save as PNG" dialog (blocking) and write `img` to the chosen
+/// path. Returns `Ok(Some(path))` on a successful write, `Ok(None)` if the user
+/// cancelled the dialog, or `Err` on write failure. The blocking modal is fine
+/// for E1: it's the user's explicit action and they're waiting on it anyway.
+fn save_via_dialog(img: &RgbaImage) -> anyhow::Result<Option<PathBuf>> {
+    let dir = directories::UserDirs::new()
+        .and_then(|ud| ud.picture_dir().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let file_name = format!("screenshot-{millis}.png");
+    let path = rfd::FileDialog::new()
+        .add_filter("PNG image", &["png"])
+        .set_directory(&dir)
+        .set_file_name(&file_name)
+        .save_file();
+    match path {
+        Some(p) => {
+            img.save(&p)
+                .with_context(|| format!("write {}", p.display()))?;
+            Ok(Some(p))
+        }
+        None => Ok(None),
+    }
 }
