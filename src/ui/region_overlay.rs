@@ -173,17 +173,18 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     if g.finished {
         return;
     }
-    let (primary_down, latest, esc, enter, released) = ui.ctx().input(|i| {
+    let (primary_down, latest, esc, enter, released, close_requested) = ui.ctx().input(|i| {
         (
             i.pointer.primary_down(),
             i.pointer.latest_pos(),
             i.key_pressed(Key::Escape),
             i.key_pressed(Key::Enter),
             i.pointer.primary_released(),
+            i.viewport().close_requested(),
         )
     });
 
-    if esc {
+    if esc || close_requested {
         g.drag_start = None;
         g.drag_cur = None;
         g.finished = true;

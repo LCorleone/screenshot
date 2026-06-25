@@ -137,6 +137,13 @@ fn enum_proc_inner(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return BOOL::from(true);
     }
 
+    // Skip our own windows (main, region overlay, pins) so hover-snap never
+    // targets the app's own UI. Their titles all start with "screenshot-dai".
+    let title = String::from_utf16_lossy(&buf[..n as usize]);
+    if title.starts_with("screenshot-dai") {
+        return BOOL::from(true);
+    }
+
     c.rects.push((l, t, r, b));
     BOOL::from(true)
 }
