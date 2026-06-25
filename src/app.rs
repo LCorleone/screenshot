@@ -9,6 +9,15 @@ use crate::capture;
 use crate::config::Settings;
 use crate::ui::pin_window::PinSession;
 
+/// Visual classification of the status message, so its color doesn't depend on
+/// substring matching against the message text (which can include file paths).
+#[derive(Clone, Copy, PartialEq)]
+enum MsgKind {
+    Info,
+    Success,
+    Error,
+}
+
 /// Top-level application state carried across frames.
 pub struct ScreenshotDaiApp {
     settings: Settings,
@@ -18,6 +27,8 @@ pub struct ScreenshotDaiApp {
     texture: Option<egui::TextureHandle>,
     /// Status / message line shown to the user.
     message: String,
+    /// Visual classification of `message`.
+    message_kind: MsgKind,
     /// Active region-selection overlay session, if any.
     region_session: Option<Arc<Mutex<crate::ui::region_overlay::RegionSession>>>,
     /// Most recent capture (fullscreen OR region), used for "Pin to desktop".
@@ -39,12 +50,19 @@ impl ScreenshotDaiApp {
             settings_buf,
             texture: None,
             message: String::new(),
+            message_kind: MsgKind::Info,
             region_session: None,
             last_image: None,
             last_scale: 1.0,
             pins: Vec::new(),
             next_pin_id: 0,
         }
+    }
+
+    /// Set the status message and its visual classification.
+    fn set_message(&mut self, kind: MsgKind, text: impl Into<String>) {
+        self.message = text.into();
+        self.message_kind = kind;
     }
 }
 
@@ -72,7 +90,10 @@ impl eframe::App for ScreenshotDaiApp {
                             let path = capture::default_save_path();
                             match capture::save_png(&path, &img) {
                                 Ok(()) => {
-                                    self.message = format!("Saved to {}", path.display());
+                                    self.set_message(
+                                        MsgKind::Success,
+                                        format!("Saved to {}", path.display()),
+                                    );
                                     let color_image = capture::rgba_image_to_color_image(&img);
                                     let handle = ui.ctx().load_texture(
                                         "captured",
@@ -84,12 +105,12 @@ impl eframe::App for ScreenshotDaiApp {
                                     self.last_scale = scale;
                                 }
                                 Err(e) => {
-                                    self.message = format!("Save failed: {e:#}");
+                                    self.set_message(MsgKind::Error, format!("Save failed: {e:#}"));
                                 }
                             }
                         }
                         Err(e) => {
-                            self.message = format!("Capture failed: {e:#}");
+                            self.set_message(MsgKind::Error, format!("Capture failed: {e:#}"));
                         }
                     }
                 }
@@ -103,7 +124,8 @@ impl eframe::App for ScreenshotDaiApp {
                             self.region_session = Some(Arc::new(Mutex::new(s)));
                             self.message.clear();
                         }
-                        Err(e) => self.message = format!("Region capture failed: {e:#}"),
+                        Err(e) => self
+                            .set_message(MsgKind::Error, format!("Region capture failed: {e:#}")),
                     }
                 }
 
@@ -152,7 +174,7 @@ impl eframe::App for ScreenshotDaiApp {
 
             // Harvest the result (takes the session out; restores it if not finished).
             let mut new_texture: Option<egui::TextureHandle> = None;
-            let mut new_message: Option<String> = None;
+            let mut new_message: Option<(MsgKind, String)> = None;
             let mut new_last_scale: Option<f32> = None;
             let taken = self.region_session.take();
             if let Some(session) = taken {
@@ -167,10 +189,15 @@ impl eframe::App for ScreenshotDaiApp {
                             let path = capture::default_save_path();
                             match capture::save_png(&path, &img) {
                                 Ok(()) => {
-                                    new_message =
-                                        Some(format!("Region saved to {}", path.display()))
+                                    new_message = Some((
+                                        MsgKind::Success,
+                                        format!("Region saved to {}", path.display()),
+                                    ))
                                 }
-                                Err(e) => new_message = Some(format!("Save failed: {e:#}")),
+                                Err(e) => {
+                                    new_message =
+                                        Some((MsgKind::Error, format!("Save failed: {e:#}")))
+                                }
                             }
                             let ci = capture::rgba_image_to_color_image(&img);
                             new_texture = Some(ui.ctx().load_texture(
@@ -182,7 +209,8 @@ impl eframe::App for ScreenshotDaiApp {
                             new_last_scale = Some(session_scale);
                         }
                         Some(crate::ui::region_overlay::RegionResult::Cancelled) => {
-                            new_message = Some("Region capture cancelled.".to_string());
+                            new_message =
+                                Some((MsgKind::Info, "Region capture cancelled.".to_string()));
                         }
                         None => {
                             // finished flag set without a result — keep the session alive defensively
@@ -196,8 +224,8 @@ impl eframe::App for ScreenshotDaiApp {
             if let Some(h) = new_texture {
                 self.texture = Some(h);
             }
-            if let Some(m) = new_message {
-                self.message = m;
+            if let Some((kind, m)) = new_message {
+                self.set_message(kind, m);
             }
             if let Some(s) = new_last_scale {
                 self.last_scale = s;
@@ -210,15 +238,10 @@ impl eframe::App for ScreenshotDaiApp {
             self.pins.retain(|s| !s.lock().expect("poisoned").closed);
 
             if !self.message.is_empty() {
-                let msg_color = {
-                    let lower = self.message.to_ascii_lowercase();
-                    if lower.contains("fail") || lower.contains("cancel") {
-                        crate::ui::theme::ERROR
-                    } else if lower.contains("saved") {
-                        crate::ui::theme::SUCCESS
-                    } else {
-                        crate::ui::theme::TEXT_SECONDARY
-                    }
+                let msg_color = match self.message_kind {
+                    MsgKind::Error => crate::ui::theme::ERROR,
+                    MsgKind::Success => crate::ui::theme::SUCCESS,
+                    MsgKind::Info => crate::ui::theme::TEXT_SECONDARY,
                 };
                 ui.label(egui::RichText::new(&self.message).color(msg_color));
             }
@@ -294,10 +317,13 @@ impl eframe::App for ScreenshotDaiApp {
                     match self.settings_buf.save() {
                         Ok(()) => {
                             self.settings = self.settings_buf.clone();
-                            self.message = "Settings saved.".to_string();
+                            self.set_message(MsgKind::Success, "Settings saved.");
                         }
                         Err(e) => {
-                            self.message = format!("Failed to save settings: {e:#}");
+                            self.set_message(
+                                MsgKind::Error,
+                                format!("Failed to save settings: {e:#}"),
+                            );
                         }
                     }
                 }
