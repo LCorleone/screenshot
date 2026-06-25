@@ -55,8 +55,17 @@ impl eframe::App for ScreenshotDaiApp {
             ui.add_space(4.0);
 
             // --- Capture ---
+            ui.label(
+                egui::RichText::new("Capture")
+                    .text_style(egui::TextStyle::Name("Section".into()))
+                    .color(crate::ui::theme::TEXT_SECONDARY),
+            );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Capture Fullscreen").clicked() {
+                if ui
+                    .add(crate::ui::theme::primary_button("Capture Fullscreen"))
+                    .clicked()
+                {
                     self.message.clear();
                     match capture::capture_monitor_under_cursor() {
                         Ok((img, scale)) => {
@@ -85,7 +94,10 @@ impl eframe::App for ScreenshotDaiApp {
                     }
                 }
 
-                if ui.button("Capture Region").clicked() {
+                if ui
+                    .add(crate::ui::theme::secondary_button("Capture Region"))
+                    .clicked()
+                {
                     match crate::ui::region_overlay::start_session(ui.ctx()) {
                         Ok(s) => {
                             self.region_session = Some(Arc::new(Mutex::new(s)));
@@ -98,7 +110,7 @@ impl eframe::App for ScreenshotDaiApp {
                 if ui
                     .add_enabled(
                         self.last_image.is_some(),
-                        egui::Button::new("Pin to desktop"),
+                        crate::ui::theme::secondary_button("Pin to Desktop"),
                     )
                     .clicked()
                 {
@@ -198,23 +210,52 @@ impl eframe::App for ScreenshotDaiApp {
             self.pins.retain(|s| !s.lock().expect("poisoned").closed);
 
             if !self.message.is_empty() {
-                ui.label(&self.message);
+                let msg_color = {
+                    let lower = self.message.to_ascii_lowercase();
+                    if lower.contains("fail") || lower.contains("cancel") {
+                        crate::ui::theme::ERROR
+                    } else if lower.contains("saved") {
+                        crate::ui::theme::SUCCESS
+                    } else {
+                        crate::ui::theme::TEXT_SECONDARY
+                    }
+                };
+                ui.label(egui::RichText::new(&self.message).color(msg_color));
             }
 
             if let Some(handle) = &self.texture {
                 ui.add_space(8.0);
-                ui.label("Most recent capture:");
-                let avail = ui.available_width();
-                let size = handle.size_vec2();
-                let scale = if size.x > 0.0 {
-                    (avail / size.x).min(1.0)
-                } else {
-                    1.0
-                };
-                ui.image(egui::load::SizedTexture::new(handle.id(), size * scale));
+                egui::Frame::group(ui.style())
+                    .fill(crate::ui::theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(crate::ui::theme::RADIUS_LG))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Most Recent Capture")
+                                .text_style(egui::TextStyle::Name("Caption".into()))
+                                .color(crate::ui::theme::TEXT_SECONDARY),
+                        );
+                        let avail = ui.available_width();
+                        let size = handle.size_vec2();
+                        let scale = if size.x > 0.0 {
+                            (avail / size.x).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        ui.image(egui::load::SizedTexture::new(handle.id(), size * scale));
+                    });
+            } else {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "No capture yet. Press Capture Fullscreen or Capture Region.",
+                    )
+                    .color(crate::ui::theme::TEXT_SECONDARY),
+                );
             }
 
-            ui.add_space(8.0);
+            ui.add_space(32.0);
             ui.separator();
 
             // --- Settings ---
@@ -222,7 +263,7 @@ impl eframe::App for ScreenshotDaiApp {
             ui.add_space(4.0);
             egui::Grid::new("settings_grid")
                 .num_columns(2)
-                .spacing([8.0, 4.0])
+                .spacing([16.0, 10.0])
                 .show(ui, |ui| {
                     ui.label("OpenAI base URL");
                     ui.text_edit_singleline(&mut self.settings_buf.openai_base_url);
@@ -246,7 +287,10 @@ impl eframe::App for ScreenshotDaiApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Save settings").clicked() {
+                if ui
+                    .add(crate::ui::theme::secondary_button("Save Settings"))
+                    .clicked()
+                {
                     match self.settings_buf.save() {
                         Ok(()) => {
                             self.settings = self.settings_buf.clone();

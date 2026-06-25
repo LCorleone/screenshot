@@ -148,7 +148,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
         let stroke = if cur_sel.is_some() {
             Stroke::new(2.0, Color32::WHITE)
         } else {
-            Stroke::new(2.0, Color32::from_rgb(120, 180, 255))
+            Stroke::new(2.0, crate::ui::theme::ACCENT_BLUE_BRIGHT)
         };
         painter.rect_stroke(sel, 0.0, stroke, egui::epaint::StrokeKind::Inside);
         let pw = ((sel.max.x - sel.min.x) * scale).round() as i32;

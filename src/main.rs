@@ -38,7 +38,10 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "screenshot-dai",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(app::ScreenshotDaiApp::new(settings)))),
+        Box::new(move |cc| {
+            ui::theme::install(&cc.egui_ctx);
+            Ok(Box::new(app::ScreenshotDaiApp::new(settings)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe exited with error: {e}"))?;
 
