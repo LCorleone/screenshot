@@ -21,6 +21,13 @@ pub struct Settings {
     pub openai_model: String,
     /// Optional OCR endpoint. Empty means "use the LLM for OCR".
     pub ocr_endpoint: String,
+    /// Hotkey modifiers display string (e.g. "Ctrl+Shift"). Stored/persisted
+    /// for a future phase; E0 still registers the hardcoded default
+    /// `Ctrl+Shift+S`.
+    pub hotkey_modifiers: String,
+    /// Hotkey key display string (e.g. "S"). Stored/persisted; not yet wired
+    /// to the live hotkey registration in E0.
+    pub hotkey_key: String,
 }
 
 impl Default for Settings {
@@ -30,6 +37,8 @@ impl Default for Settings {
             openai_api_key: String::new(),
             openai_model: "gpt-4o".to_string(),
             ocr_endpoint: String::new(),
+            hotkey_modifiers: "Ctrl+Shift".to_string(),
+            hotkey_key: "S".to_string(),
         }
     }
 }

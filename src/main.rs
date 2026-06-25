@@ -42,8 +42,9 @@ fn main() -> anyhow::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("screenshot-dai")
-            .with_inner_size([800.0, 600.0]),
+            .with_title("screenshot-dai Settings")
+            .with_inner_size([420.0, 480.0])
+            .with_visible(false),
         ..Default::default()
     };
     tracing::info!("launching eframe");

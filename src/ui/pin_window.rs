@@ -1,4 +1,5 @@
 //! Floating pinned-screenshot windows.
+#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 

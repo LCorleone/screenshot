@@ -67,6 +67,7 @@ pub fn capture_monitor(monitor: &xcap::Monitor) -> anyhow::Result<image::RgbaIma
 /// Capture the monitor under the OS cursor; falls back to primary when the
 /// cursor position can't be read (non-Windows). Returns the image and the
 /// captured monitor's scale factor.
+#[allow(dead_code)]
 pub fn capture_monitor_under_cursor() -> anyhow::Result<(image::RgbaImage, f32)> {
     let monitor = match crate::platform::cursor_screen_physical() {
         Some(pt) => monitor_at_physical(pt)?,
@@ -164,6 +165,7 @@ pub fn rgba_image_to_color_image(img: &image::RgbaImage) -> ColorImage {
 }
 
 /// Write the image as a PNG to `path`.
+#[allow(dead_code)]
 pub fn save_png(path: &Path, img: &image::RgbaImage) -> anyhow::Result<()> {
     img.save(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -182,6 +184,7 @@ pub fn encode_png_bytes(img: &image::RgbaImage) -> anyhow::Result<Vec<u8>> {
 
 /// Build a timestamped output path for a new screenshot under the OS pictures
 /// dir (falls back to the current dir when that is unavailable).
+#[allow(dead_code)]
 pub fn default_save_path() -> PathBuf {
     let dir = directories::UserDirs::new()
         .and_then(|ud| ud.picture_dir().map(Path::to_path_buf))

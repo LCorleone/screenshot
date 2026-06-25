@@ -48,6 +48,7 @@ pub const FAMILY_SEMIBOLD: &str = "GeistSansSemiBold";
 /// `FontId` for a small section header (Geist SemiBold 15px).
 /// Use this directly instead of a named `TextStyle`, which can panic if the
 /// style isn't registered on the active `Ui`.
+#[allow(dead_code)]
 pub fn section_font() -> egui::FontId {
     egui::FontId::new(15.0, egui::FontFamily::Name(FAMILY_SEMIBOLD.into()))
 }
@@ -207,6 +208,7 @@ fn install_visuals(ctx: &egui::Context) {
 // --- Button builders --------------------------------------------------------
 
 /// Primary call-to-action button: bright surface, dark text.
+#[allow(dead_code)]
 pub fn primary_button(label: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     let text: egui::WidgetText = label.into();
     egui::Button::new(text.color(Color32::BLACK))
