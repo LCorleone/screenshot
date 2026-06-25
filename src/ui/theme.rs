@@ -45,6 +45,18 @@ pub const FAMILY_MEDIUM: &str = "GeistSansMedium";
 /// Name of the named `FontFamily` resolving to Geist SemiBold (headings).
 pub const FAMILY_SEMIBOLD: &str = "GeistSansSemiBold";
 
+/// `FontId` for a small section header (Geist SemiBold 15px).
+/// Use this directly instead of a named `TextStyle`, which can panic if the
+/// style isn't registered on the active `Ui`.
+pub fn section_font() -> egui::FontId {
+    egui::FontId::new(15.0, egui::FontFamily::Name(FAMILY_SEMIBOLD.into()))
+}
+
+/// `FontId` for a caption (Geist Regular 12px).
+pub fn caption_font() -> egui::FontId {
+    egui::FontId::new(12.0, egui::FontFamily::Proportional)
+}
+
 /// Install Geist fonts → text styles/spacing → dark visuals onto `ctx`.
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);

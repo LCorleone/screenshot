@@ -75,7 +75,7 @@ impl eframe::App for ScreenshotDaiApp {
             // --- Capture ---
             ui.label(
                 egui::RichText::new("Capture")
-                    .text_style(egui::TextStyle::Name("Section".into()))
+                    .font(crate::ui::theme::section_font())
                     .color(crate::ui::theme::TEXT_SECONDARY),
             );
             ui.add_space(4.0);
@@ -256,7 +256,7 @@ impl eframe::App for ScreenshotDaiApp {
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new("Most Recent Capture")
-                                .text_style(egui::TextStyle::Name("Caption".into()))
+                                .font(crate::ui::theme::caption_font())
                                 .color(crate::ui::theme::TEXT_SECONDARY),
                         );
                         let avail = ui.available_width();
