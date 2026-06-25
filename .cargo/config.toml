@@ -1,0 +1,7 @@
+# Build configuration for screenshot-dai.
+#
+# Statically link the C runtime on Windows so the release binary has NO
+# external DLL dependency (no need for the Microsoft VC++ Redistributable).
+# This makes the distributed .exe fully self-contained.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
