@@ -210,10 +210,10 @@ fn crop(full: &RgbaImage, sel: Rect, origin: Pos2, scale: f32) -> Option<RgbaIma
     let h = ((sel.max.y - sel.min.y) * scale).round() as i32;
     let x = x.clamp(0, iw);
     let y = y.clamp(0, ih);
-    let w = w.clamp(1, iw - x);
-    let h = h.clamp(1, ih - y);
-    if w <= 0 || h <= 0 {
+    if x >= iw || y >= ih {
         return None;
     }
+    let w = w.min(iw - x).max(1);
+    let h = h.min(ih - y).max(1);
     Some(image::imageops::crop_imm(full, x as u32, y as u32, w as u32, h as u32).to_image())
 }

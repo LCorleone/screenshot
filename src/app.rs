@@ -34,6 +34,7 @@ impl ScreenshotDaiApp {
 
 impl eframe::App for ScreenshotDaiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("screenshot-dai");
         ui.add_space(4.0);
 
@@ -199,6 +200,7 @@ impl eframe::App for ScreenshotDaiApp {
             if ui.button("Reset").clicked() {
                 self.settings_buf = self.settings.clone();
             }
+        });
         });
     }
 }

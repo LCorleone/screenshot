@@ -30,12 +30,7 @@ pub fn primary_monitor() -> anyhow::Result<xcap::Monitor> {
 
 /// Capture the primary monitor and return it as an RGBA image.
 pub fn capture_primary_monitor() -> anyhow::Result<image::RgbaImage> {
-    let monitors = Monitor::all().context("failed to enumerate monitors")?;
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .or_else(|| monitors.first())
-        .ok_or_else(|| anyhow::anyhow!("no monitors found"))?;
+    let monitor = primary_monitor()?;
     let img = monitor
         .capture_image()
         .with_context(|| format!("failed to capture monitor {:?}", monitor.name()))?;
@@ -73,7 +68,7 @@ pub fn default_save_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
     dir.join(format!("screenshot-{ts}.png"))
 }

@@ -21,8 +21,6 @@ pub struct Settings {
     pub openai_model: String,
     /// Optional OCR endpoint. Empty means "use the LLM for OCR".
     pub ocr_endpoint: String,
-    /// Where to save screenshots. Empty means "OS pictures dir / current dir".
-    pub save_dir: String,
 }
 
 impl Default for Settings {
@@ -32,7 +30,6 @@ impl Default for Settings {
             openai_api_key: String::new(),
             openai_model: "gpt-4o".to_string(),
             ocr_endpoint: String::new(),
-            save_dir: String::new(),
         }
     }
 }
