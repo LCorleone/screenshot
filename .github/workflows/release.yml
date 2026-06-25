@@ -1,0 +1,60 @@
+name: Release
+
+# Manual trigger only. Builds the Windows release binary (self-contained,
+# +crt-static) and attaches the RAW .exe to a draft GitHub Release, so it's
+# directly downloadable (no zip). Mirrors the pi-desktop release pattern.
+#
+# How to run:
+#   GitHub UI:  Actions tab -> "Release" -> "Run workflow" -> pick a branch
+#   CLI:        gh workflow run release.yml --repo LCorleone/screenshot -r july-dev
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the release
+
+jobs:
+  build:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        # .cargo/config.toml already sets +crt-static for windows-msvc, so the
+        # binary is self-contained (no VC++ Redistributable dependency).
+        run: cargo build --release --locked
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-dai-windows
+          path: target/release/screenshot-dai.exe
+          if-no-files-found: error
+
+  publish:
+    name: Publish draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: screenshot-dai-windows
+          path: artifacts
+
+      - name: Create draft release with the .exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-build-${{ github.run_number }}
+          name: screenshot-dai dev-build-${{ github.run_number }} (${{ github.ref_name }})
+          body: |
+            Self-contained Windows build from branch `${{ github.ref_name }}` (commit `${{ github.sha }}).
+
+            Download `screenshot-dai.exe` below and run it directly — no installer, no zip, no external DLLs needed.
+          draft: true
+          prerelease: false
+          files: |
+            artifacts/screenshot-dai.exe
