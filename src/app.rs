@@ -14,6 +14,9 @@ pub struct ScreenshotDaiApp {
     texture: Option<egui::TextureHandle>,
     /// Status / message line shown to the user.
     message: String,
+    /// Active region-selection overlay session, if any.
+    region_session:
+        Option<std::sync::Arc<std::sync::Mutex<crate::ui::region_overlay::RegionSession>>>,
 }
 
 impl ScreenshotDaiApp {
@@ -24,6 +27,7 @@ impl ScreenshotDaiApp {
             settings_buf,
             texture: None,
             message: String::new(),
+            region_session: None,
         }
     }
 }
@@ -61,7 +65,77 @@ impl eframe::App for ScreenshotDaiApp {
                     }
                 }
             }
+
+            if ui.button("Capture Region").clicked() {
+                match crate::ui::region_overlay::start_session(ui.ctx()) {
+                    Ok(s) => {
+                        self.region_session = Some(std::sync::Arc::new(std::sync::Mutex::new(s)));
+                        self.message.clear();
+                    }
+                    Err(e) => self.message = format!("Region capture failed: {e:#}"),
+                }
+            }
         });
+
+        // Show the overlay while a session is active.
+        if let Some(session) = self.region_session.clone() {
+            let size_logical = session.lock().expect("poisoned").size_logical;
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("region_overlay"),
+                egui::ViewportBuilder::default()
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_always_on_top()
+                    .with_position([0.0, 0.0])
+                    .with_inner_size(size_logical)
+                    .with_title("screenshot-dai region"),
+                move |ui, _class| {
+                    crate::ui::region_overlay::draw_overlay(ui, &session);
+                },
+            );
+        }
+
+        // Harvest the result (takes the session out; restores it if not finished).
+        let mut new_texture: Option<egui::TextureHandle> = None;
+        let mut new_message: Option<String> = None;
+        let taken = self.region_session.take();
+        if let Some(session) = taken {
+            let finished = session.lock().expect("poisoned").finished;
+            if finished {
+                let result = session.lock().expect("poisoned").result.take();
+                match result {
+                    Some(crate::ui::region_overlay::RegionResult::Cropped(img)) => {
+                        let path = capture::default_save_path();
+                        match capture::save_png(&path, &img) {
+                            Ok(()) => {
+                                new_message = Some(format!("Region saved to {}", path.display()))
+                            }
+                            Err(e) => new_message = Some(format!("Save failed: {e:#}")),
+                        }
+                        let ci = capture::rgba_image_to_color_image(&img);
+                        new_texture = Some(
+                            ui.ctx()
+                                .load_texture("captured", ci, egui::TextureOptions::LINEAR),
+                        );
+                    }
+                    Some(crate::ui::region_overlay::RegionResult::Cancelled) => {
+                        new_message = Some("Region capture cancelled.".to_string());
+                    }
+                    None => {
+                        // finished flag set without a result — keep the session alive defensively
+                        self.region_session = Some(session);
+                    }
+                }
+            } else {
+                self.region_session = Some(session);
+            }
+        }
+        if let Some(h) = new_texture {
+            self.texture = Some(h);
+        }
+        if let Some(m) = new_message {
+            self.message = m;
+        }
 
         if !self.message.is_empty() {
             ui.label(&self.message);

@@ -1,1 +1,3 @@
-//! UI panels for OCR / chat / translate, added in later phases.
+//! UI panels and overlays.
+
+pub mod region_overlay;

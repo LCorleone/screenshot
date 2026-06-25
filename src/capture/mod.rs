@@ -17,6 +17,17 @@ use anyhow::Context;
 use egui::ColorImage;
 use xcap::Monitor;
 
+/// Get the primary monitor (falls back to the first available).
+pub fn primary_monitor() -> anyhow::Result<xcap::Monitor> {
+    let monitors = Monitor::all().context("failed to enumerate monitors")?;
+    monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no monitors found"))
+}
+
 /// Capture the primary monitor and return it as an RGBA image.
 pub fn capture_primary_monitor() -> anyhow::Result<image::RgbaImage> {
     let monitors = Monitor::all().context("failed to enumerate monitors")?;

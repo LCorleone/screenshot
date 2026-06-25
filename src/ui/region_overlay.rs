@@ -1,0 +1,219 @@
+//! Region-selection overlay: a frozen snapshot of the primary monitor with a
+//! draggable crop box. Esc cancels; mouse-up or Enter confirms.
+
+use std::sync::{Arc, Mutex};
+
+use eframe::egui;
+use egui::{Align2, Color32, Key, Pos2, Rect, Stroke, Vec2};
+use image::RgbaImage;
+
+/// Minimum drag size (logical points) below which a selection is ignored.
+const MIN_DRAG: f32 = 4.0;
+
+/// Outcome of a finished region session.
+pub enum RegionResult {
+    /// User confirmed a selection; contains the cropped pixels.
+    Cropped(RgbaImage),
+    /// User pressed Esc.
+    Cancelled,
+}
+
+/// Shared state between the main app and the overlay viewport.
+pub struct RegionSession {
+    /// Full primary-monitor screenshot.
+    pub full_image: RgbaImage,
+    /// egui texture over `full_image`, kept alive here.
+    pub texture: Option<egui::TextureHandle>,
+    /// Image dims in physical pixels.
+    pub image_px: [usize; 2],
+    /// Physical pixels per logical point (monitor scale factor).
+    pub scale: f32,
+    /// Logical on-screen size of the overlay (= monitor in logical points).
+    pub size_logical: Vec2,
+    /// Drag origin in logical overlay coords while dragging.
+    pub drag_start: Option<Pos2>,
+    /// Current pointer in logical overlay coords while dragging.
+    pub drag_cur: Option<Pos2>,
+    /// Set when the session is done.
+    pub finished: bool,
+    /// Result once finished.
+    pub result: Option<RegionResult>,
+}
+
+impl RegionSession {
+    pub fn new(full_image: RgbaImage, scale: f32, size_logical: Vec2) -> Self {
+        let image_px = [full_image.width() as usize, full_image.height() as usize];
+        Self {
+            full_image,
+            texture: None,
+            image_px,
+            scale,
+            size_logical,
+            drag_start: None,
+            drag_cur: None,
+            finished: false,
+            result: None,
+        }
+    }
+
+    /// Current selection rect in logical coords, if any.
+    fn current_rect(&self) -> Option<Rect> {
+        match (self.drag_start, self.drag_cur) {
+            (Some(a), Some(b)) => Some(Rect::from_two_pos(a, b)),
+            _ => None,
+        }
+    }
+}
+
+/// Capture the primary monitor and build a ready-to-show session.
+pub fn start_session(ctx: &egui::Context) -> anyhow::Result<RegionSession> {
+    let mon = crate::capture::primary_monitor()?;
+    let scale = mon.scale_factor().unwrap_or(1.0).max(0.0001);
+    let w_px = mon.width().unwrap_or(0) as f32;
+    let h_px = mon.height().unwrap_or(0) as f32;
+    let img = mon.capture_image()?;
+    let size_logical = Vec2::new(w_px / scale, h_px / scale);
+    let mut session = RegionSession::new(img, scale, size_logical);
+    let color_image = crate::capture::rgba_image_to_color_image(&session.full_image);
+    let handle = ctx.load_texture("region-bg", color_image, egui::TextureOptions::LINEAR);
+    session.texture = Some(handle);
+    Ok(session)
+}
+
+/// Draw the overlay into its viewport `ui` and update `session`.
+pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
+    let screen = ui.ctx().content_rect();
+
+    // Read-only pass: gather what we need to paint.
+    let (tex_id, image_px, scale, cur_sel) = {
+        let g = session.lock().expect("region session poisoned");
+        let id = g
+            .texture
+            .as_ref()
+            .map(|t| t.id())
+            .unwrap_or(egui::TextureId::Managed(0));
+        (id, g.image_px, g.scale, g.current_rect())
+    };
+
+    let painter = ui.painter().clone();
+
+    // 1. frozen screenshot filling the overlay
+    painter.image(
+        tex_id,
+        screen,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    // 2. dim everything
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+
+    // 3. spotlight + label
+    if let Some(sel) = cur_sel {
+        let uv = to_uv(sel, screen.min, scale, image_px);
+        painter.image(tex_id, sel, uv, Color32::WHITE);
+        painter.rect_stroke(
+            sel,
+            0.0,
+            Stroke::new(2.0, Color32::WHITE),
+            egui::epaint::StrokeKind::Inside,
+        );
+        let pw = ((sel.max.x - sel.min.x) * scale).round() as i32;
+        let ph = ((sel.max.y - sel.min.y) * scale).round() as i32;
+        painter.debug_text(
+            sel.min + Vec2::new(4.0, -4.0),
+            Align2::LEFT_BOTTOM,
+            Color32::WHITE,
+            format!("{} × {}", pw, ph),
+        );
+    } else {
+        painter.debug_text(
+            screen.center(),
+            Align2::CENTER_CENTER,
+            Color32::WHITE,
+            "Drag to select · Esc to cancel",
+        );
+    }
+
+    // 4. input handling (mutable pass)
+    let mut g = session.lock().expect("region session poisoned");
+    if g.finished {
+        return;
+    }
+    let (primary_down, latest, esc, enter, released) = ui.ctx().input(|i| {
+        (
+            i.pointer.primary_down(),
+            i.pointer.latest_pos(),
+            i.key_pressed(Key::Escape),
+            i.key_pressed(Key::Enter),
+            i.pointer.primary_released(),
+        )
+    });
+
+    if esc {
+        g.drag_start = None;
+        g.drag_cur = None;
+        g.finished = true;
+        g.result = Some(RegionResult::Cancelled);
+        return;
+    }
+
+    if enter {
+        if let Some(r) = g.current_rect() {
+            if (r.max.x - r.min.x).abs() > MIN_DRAG && (r.max.y - r.min.y).abs() > MIN_DRAG {
+                if let Some(cropped) = crop(&g.full_image, r, screen.min, g.scale) {
+                    g.finished = true;
+                    g.result = Some(RegionResult::Cropped(cropped));
+                    return;
+                }
+            }
+        }
+    }
+
+    if primary_down {
+        if g.drag_start.is_none() {
+            g.drag_start = latest;
+        }
+        g.drag_cur = latest;
+    } else if released {
+        if let Some(r) = g.current_rect() {
+            if (r.max.x - r.min.x).abs() > MIN_DRAG && (r.max.y - r.min.y).abs() > MIN_DRAG {
+                if let Some(cropped) = crop(&g.full_image, r, screen.min, g.scale) {
+                    g.finished = true;
+                    g.result = Some(RegionResult::Cropped(cropped));
+                    g.drag_start = None;
+                    g.drag_cur = None;
+                    return;
+                }
+            }
+        }
+        g.drag_start = None;
+        g.drag_cur = None;
+    }
+}
+
+/// Map a logical selection rect to image UV coordinates.
+fn to_uv(sel: Rect, origin: Pos2, scale: f32, image_px: [usize; 2]) -> Rect {
+    let (iw, ih) = (image_px[0] as f32, image_px[1] as f32);
+    let x0 = (((sel.min.x - origin.x) * scale).clamp(0.0, iw)) / iw;
+    let y0 = (((sel.min.y - origin.y) * scale).clamp(0.0, ih)) / ih;
+    let x1 = (((sel.max.x - origin.x) * scale).clamp(0.0, iw)) / iw;
+    let y1 = (((sel.max.y - origin.y) * scale).clamp(0.0, ih)) / ih;
+    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1))
+}
+
+/// Crop the full image to the logical selection rect, returning physical pixels.
+fn crop(full: &RgbaImage, sel: Rect, origin: Pos2, scale: f32) -> Option<RgbaImage> {
+    let (iw, ih) = (full.width() as i32, full.height() as i32);
+    let x = ((sel.min.x - origin.x) * scale).round() as i32;
+    let y = ((sel.min.y - origin.y) * scale).round() as i32;
+    let w = ((sel.max.x - sel.min.x) * scale).round() as i32;
+    let h = ((sel.max.y - sel.min.y) * scale).round() as i32;
+    let x = x.clamp(0, iw);
+    let y = y.clamp(0, ih);
+    let w = w.clamp(1, iw - x);
+    let h = h.clamp(1, ih - y);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(image::imageops::crop_imm(full, x as u32, y as u32, w as u32, h as u32).to_image())
+}
