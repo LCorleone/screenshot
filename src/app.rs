@@ -12,6 +12,7 @@
 //!   does nothing.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -120,7 +121,11 @@ impl ScreenshotDaiApp {
             tracing::warn!("failed to create tray icon (continuing without it)");
         }
 
-        // --- Global hotkey manager + default Ctrl+Shift+S registration. ---
+        // --- Global hotkey manager + hotkey parsed from Settings at startup. ---
+        // Build the combo string (e.g. "Ctrl+Shift+S") from the configured
+        // modifier + key fields; parse via HotKey::from_str. On any parse or
+        // registration failure, fall back to the default Ctrl+Shift+S and log.
+        // Applied only at startup; changing the fields takes effect next launch.
         let hotkey_manager = GlobalHotKeyManager::new()
             .map_err(|e| {
                 tracing::warn!("failed to create global hotkey manager: {e}");
@@ -128,9 +133,28 @@ impl ScreenshotDaiApp {
             })
             .ok();
         if let Some(gm) = &hotkey_manager {
-            let hk = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+            let combo = format!(
+                "{}+{}",
+                settings.hotkey_modifiers.trim(),
+                settings.hotkey_key.trim()
+            );
+            let fallback = || HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+            let hk = match HotKey::from_str(&combo) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to parse configured hotkey {combo:?}: {e}; using Ctrl+Shift+S"
+                    );
+                    fallback()
+                }
+            };
             if let Err(e) = gm.register(hk) {
-                tracing::warn!("failed to register global hotkey Ctrl+Shift+S: {e}");
+                tracing::warn!(
+                    "failed to register hotkey {combo:?}: {e}; retrying with Ctrl+Shift+S"
+                );
+                if let Err(e) = gm.register(fallback()) {
+                    tracing::warn!("fallback hotkey registration also failed: {e}");
+                }
             }
         }
 
