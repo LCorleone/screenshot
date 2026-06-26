@@ -48,8 +48,8 @@ const UNDO_CAP: usize = 10;
 /// Soft byte budget for the undo stack (~256 MB). Oldest snapshots are dropped
 /// once exceeded, in addition to the [`UNDO_CAP`] count limit.
 const UNDO_BYTES_BUDGET: usize = 256 * 1024 * 1024;
-/// Default annotation color (a clear red).
-const ACTIVE_COLOR_DEFAULT: Color32 = Color32::from_rgb(220, 0, 0);
+/// Default annotation color (Solarized blue — pops on the light backdrop).
+const ACTIVE_COLOR_DEFAULT: Color32 = Color32::from_rgb(0x26, 0x8b, 0xd2);
 /// Default annotation stroke width, in logical px.
 const ACTIVE_WIDTH_DEFAULT: f32 = 2.0;
 /// Logical text size baked by the ab_glyph renderer (DPI-scaled to physical).
@@ -58,14 +58,15 @@ const TEXT_LOGICAL_SIZE: f32 = 16.0;
 /// Keeping it as `&'static [u8]` avoids storing a `!Sync` `FontVec` on the
 /// `Arc<Mutex<RegionSession>>` (the parse per text commit is infrequent).
 const GEIST_FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/Geist-Regular.ttf");
-/// Preset colors offered by the Color popover, in toolbar order.
+/// Preset colors offered by the Color popover, in toolbar order. Solarized
+/// accent set — reads well on the light backdrop and matches the theme.
 const COLOR_PRESETS: [Color32; 6] = [
-    Color32::from_rgb(220, 0, 0),     // red
-    Color32::from_rgb(46, 204, 113),  // green
-    Color32::from_rgb(0, 110, 254),   // blue
-    Color32::from_rgb(241, 196, 15),  // yellow
-    Color32::from_rgb(0, 0, 0),       // black
-    Color32::from_rgb(255, 255, 255), // white
+    Color32::from_rgb(0x26, 0x8b, 0xd2), // blue
+    Color32::from_rgb(0xdc, 0x32, 0x2f), // red
+    Color32::from_rgb(0x85, 0x99, 0x00), // green
+    Color32::from_rgb(0xcb, 0x4b, 0x16), // orange
+    Color32::from_rgb(0xd3, 0x36, 0x82), // magenta
+    Color32::from_rgb(0x58, 0x6e, 0x75), // base01 (dark gray for text)
 ];
 
 /// Overlay phase.
@@ -457,9 +458,10 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     // --- PAINT ---
     match r.phase {
         Phase::Select => {
-            // 1. frozen screenshot + 2. dim everything
+            // 1. frozen screenshot + 2. dim everything (light scrim so the
+            //    spotlighted selection + annotations pop without pure-black ugly).
             painter.image(r.tex_id, screen, full_uv, Color32::WHITE);
-            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(90));
 
             // 3. spotlight + label. While not dragging, a live hover-snap rect
             //    (if any) acts as the preview selection.
@@ -480,23 +482,25 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                 painter.debug_text(
                     sel.min + Vec2::new(4.0, -4.0),
                     Align2::LEFT_BOTTOM,
-                    Color32::WHITE,
+                    // Dark Solarized base03 — readable on the light scrim.
+                    Color32::from_rgb(0x00, 0x2b, 0x36),
                     format!("{} × {}", pw, ph),
                 );
             } else {
                 painter.debug_text(
                     screen.center(),
                     Align2::CENTER_CENTER,
-                    Color32::WHITE,
+                    // Dark Solarized base03 — readable on the light scrim.
+                    Color32::from_rgb(0x00, 0x2b, 0x36),
                     "Drag to select · click a window to snap · Esc to cancel",
                 );
             }
         }
         Phase::Edit => {
             // Dimmed full screenshot, then the doc at full brightness in its
-            // original position (spotlight).
+            // original position (spotlight). Light scrim matches the Select phase.
             painter.image(r.tex_id, screen, full_uv, Color32::WHITE);
-            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(90));
             if let (Some(doc_tex), Some(drect)) = (r.doc_tex_id, r.doc_rect) {
                 painter.image(doc_tex, drect, full_uv, Color32::WHITE);
                 painter.rect_stroke(
@@ -1104,7 +1108,7 @@ fn paint_region_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
 /// otherwise. Matches the existing Rect button treatment, generalized.
 fn tool_button(ui: &mut egui::Ui, label: &'static str, active: bool) -> bool {
     let btn = if active {
-        egui::Button::new(egui::RichText::new(label).color(Color32::BLACK))
+        egui::Button::new(egui::RichText::new(label).color(Color32::WHITE))
             .fill(crate::ui::theme::ACCENT_BLUE_BRIGHT)
             .corner_radius(egui::CornerRadius::same(crate::ui::theme::RADIUS_SM))
             .min_size(egui::vec2(0.0, 36.0))

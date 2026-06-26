@@ -484,8 +484,8 @@ fn save_via_dialog(img: &RgbaImage) -> anyhow::Result<Option<PathBuf>> {
 /// files required.
 fn tray_icon_rgba() -> Vec<u8> {
     const S: usize = 32;
-    // Accent blue (matches crate::ui::theme::ACCENT_BLUE).
-    let (br, bg, bb) = (0x00u8, 0x6eu8, 0xfeu8);
+    // Accent blue — Solarized blue (matches crate::ui::theme::ACCENT_BLUE).
+    let (br, bg, bb) = (0x26u8, 0x8bu8, 0xd2u8);
     let (wr, wg, wb) = (0xffu8, 0xffu8, 0xffu8);
     let mut rgba = vec![0u8; S * S * 4];
 
