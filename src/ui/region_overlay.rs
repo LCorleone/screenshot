@@ -70,6 +70,10 @@ pub enum Tool {
     Pencil,
     /// Text tool (in-place single-line text, baked via a 5x7 bitmap font).
     Text,
+    /// Gaussian blur applied to the dragged region (drag a box, release).
+    Blur,
+    /// Pixelate (mosaic) applied to the dragged region (drag a box, release).
+    Mosaic,
 }
 
 /// Terminal outcome produced by the editor. The app harvests one of these when
@@ -96,6 +100,8 @@ enum ToolbarAction {
     ToggleArrow,
     TogglePencil,
     ToggleText,
+    ToggleBlur,
+    ToggleMosaic,
     Undo,
     Pin,
     Save,
@@ -492,6 +498,11 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                         painter.line(r.pencil_points.clone(), white);
                     }
                 }
+                Tool::Blur | Tool::Mosaic => {
+                    if let (Some(ds), Some(dc)) = (r.tool_drag_start, r.tool_drag_cur) {
+                        paint_region_preview(&painter, ds, dc);
+                    }
+                }
                 Tool::None | Tool::Text => {}
             }
 
@@ -544,6 +555,12 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                 }
                                 if tool_button(ui, "Text", is_active(Tool::Text)) {
                                     action = Some(ToolbarAction::ToggleText);
+                                }
+                                if tool_button(ui, "Blur", is_active(Tool::Blur)) {
+                                    action = Some(ToolbarAction::ToggleBlur);
+                                }
+                                if tool_button(ui, "Mosaic", is_active(Tool::Mosaic)) {
+                                    action = Some(ToolbarAction::ToggleMosaic);
                                 }
                                 if ui
                                     .add_enabled(
@@ -788,6 +805,22 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                         Tool::Text
                     };
                 }
+                Some(ToolbarAction::ToggleBlur) => {
+                    g.cancel_in_progress();
+                    g.active_tool = if g.active_tool == Tool::Blur {
+                        Tool::None
+                    } else {
+                        Tool::Blur
+                    };
+                }
+                Some(ToolbarAction::ToggleMosaic) => {
+                    g.cancel_in_progress();
+                    g.active_tool = if g.active_tool == Tool::Mosaic {
+                        Tool::None
+                    } else {
+                        Tool::Mosaic
+                    };
+                }
                 Some(ToolbarAction::Undo) => {
                     if let Some(prev) = g.undo_stack.pop() {
                         g.doc = Some(prev);
@@ -828,7 +861,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                 Tool::None | Tool::Text => {
                     // Text anchor placement is handled below for the Text tool.
                 }
-                Tool::Rect | Tool::Arrow => {
+                Tool::Rect | Tool::Arrow | Tool::Blur | Tool::Mosaic => {
                     if let Some(drect) = g.doc_rect {
                         if canvas_is_down {
                             if let Some(p) = latest {
@@ -845,17 +878,50 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                     && (dc.y - ds.y).abs() > MIN_DRAG;
                                 if drag {
                                     if let Some(base) = g.doc.clone() {
-                                        let mut nd = base;
                                         match g.active_tool {
                                             Tool::Rect => {
-                                                rasterize_rect(&mut nd, drect.min, ds, dc, g.scale)
+                                                let mut nd = base;
+                                                rasterize_rect(&mut nd, drect.min, ds, dc, g.scale);
+                                                g.commit_doc(&ctx, nd);
                                             }
                                             Tool::Arrow => {
-                                                rasterize_arrow(&mut nd, drect.min, ds, dc, g.scale)
+                                                let mut nd = base;
+                                                rasterize_arrow(
+                                                    &mut nd, drect.min, ds, dc, g.scale,
+                                                );
+                                                g.commit_doc(&ctx, nd);
+                                            }
+                                            Tool::Blur => {
+                                                let (dw, dh) =
+                                                    (base.width() as i32, base.height() as i32);
+                                                if let Some((x0, y0, x1, y1)) = drag_region_physical(
+                                                    drect.min, ds, dc, g.scale, dw, dh,
+                                                ) {
+                                                    // 5 logical px of blur, in physical px.
+                                                    let sigma = (5.0 * g.scale).max(1.0);
+                                                    let nd = apply_blur_region(
+                                                        &base, x0, y0, x1, y1, sigma,
+                                                    );
+                                                    g.commit_doc(&ctx, nd);
+                                                }
+                                            }
+                                            Tool::Mosaic => {
+                                                let (dw, dh) =
+                                                    (base.width() as i32, base.height() as i32);
+                                                if let Some((x0, y0, x1, y1)) = drag_region_physical(
+                                                    drect.min, ds, dc, g.scale, dw, dh,
+                                                ) {
+                                                    // 10 logical px blocks, in physical px.
+                                                    let block =
+                                                        ((10.0 * g.scale).round() as u32).max(2);
+                                                    let nd = apply_mosaic_region(
+                                                        &base, x0, y0, x1, y1, block,
+                                                    );
+                                                    g.commit_doc(&ctx, nd);
+                                                }
                                             }
                                             _ => {}
                                         }
-                                        g.commit_doc(&ctx, nd);
                                     }
                                 }
                                 g.tool_drag_start = None;
@@ -965,6 +1031,21 @@ fn paint_arrow_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
     }
 }
 
+/// Live preview for the Blur / Mosaic tools: a semi-transparent accent fill
+/// plus a bright accent outline over the dragged region, so the user sees the
+/// target box that will be affected. Painter-only (no pixel work) so it stays
+/// cheap per frame.
+fn paint_region_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
+    let rect = Rect::from_two_pos(ds, dc);
+    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(71, 168, 255, 48));
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(2.0, crate::ui::theme::ACCENT_BLUE_BRIGHT),
+        egui::epaint::StrokeKind::Inside,
+    );
+}
+
 /// A tool-toggle button: accent fill (dark text) when active, secondary style
 /// otherwise. Matches the existing Rect button treatment, generalized.
 fn tool_button(ui: &mut egui::Ui, label: &'static str, active: bool) -> bool {
@@ -983,8 +1064,8 @@ fn tool_button(ui: &mut egui::Ui, label: &'static str, active: bool) -> bool {
 /// flipping to the opposite side (above-left) when it would run off-screen.
 /// Uses a rough toolbar size estimate; it only needs to be approximately right.
 fn toolbar_position(sel: Rect, screen: Rect) -> Pos2 {
-    // 10 buttons * ~56pt each, ~48pt tall with padding.
-    let tb_w = 10.0 * 56.0;
+    // 12 buttons * ~56pt each, ~48pt tall with padding.
+    let tb_w = 12.0 * 56.0;
     let tb_h = 48.0;
     let mut pos = sel.max + Vec2::new(4.0, 4.0);
     if pos.x + tb_w > screen.max.x {
@@ -1464,6 +1545,90 @@ fn crop(full: &RgbaImage, sel: Rect, origin: Pos2, scale: f32) -> Option<RgbaIma
     Some(image::imageops::crop_imm(full, x as u32, y as u32, w as u32, h as u32).to_image())
 }
 
+/// Map a logical drag rect (overlay-local) to a clamped physical-pixel
+/// half-open region `[x0, x1) × [y0, y1)` of a `doc_w × doc_h` document, using
+/// the same corner-rounding math as [`rasterize_rect`]. Returns `None` if the
+/// region is degenerate (≤ 1 px wide/tall) or ends up entirely outside the doc
+/// after clamping — the caller treats that as a no-op (no commit).
+fn drag_region_physical(
+    sel_min_logical: Pos2,
+    a: Pos2,
+    b: Pos2,
+    scale: f32,
+    doc_w: i32,
+    doc_h: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    let ax = ((a.x - sel_min_logical.x) * scale).round() as i32;
+    let bx = ((b.x - sel_min_logical.x) * scale).round() as i32;
+    let ay = ((a.y - sel_min_logical.y) * scale).round() as i32;
+    let by = ((b.y - sel_min_logical.y) * scale).round() as i32;
+    let x0 = ax.min(bx).max(0);
+    let x1 = ax.max(bx).min(doc_w);
+    let y0 = ay.min(by).max(0);
+    let y1 = ay.max(by).min(doc_h);
+    if x1 <= x0 + 1 || y1 <= y0 + 1 {
+        None
+    } else {
+        Some((x0, y0, x1, y1))
+    }
+}
+
+/// Apply a gaussian blur to the half-open region `[x0, x1) × [y0, y1)` of `doc`
+/// (physical px) and return the resulting document. `sigma` is in physical px.
+/// The region is clamped to doc bounds first; a degenerate region (`x1 <= x0`
+/// or `y1 <= y0`, including fully-off-canvas) is a no-op returning a clone of
+/// the input. Only the region's pixels change — everything outside is verbatim.
+fn apply_blur_region(doc: &RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, sigma: f32) -> RgbaImage {
+    let (w, h) = (doc.width() as i32, doc.height() as i32);
+    let x0 = x0.max(0).min(w);
+    let x1 = x1.max(0).min(w);
+    let y0 = y0.max(0).min(h);
+    let y1 = y1.max(0).min(h);
+    if x1 <= x0 || y1 <= y0 {
+        return doc.clone();
+    }
+    let (rw, rh) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    let sub = image::imageops::crop_imm(doc, x0 as u32, y0 as u32, rw, rh).to_image();
+    let blurred = image::imageops::blur(&sub, sigma);
+    let mut nd = doc.clone();
+    image::imageops::replace(&mut nd, &blurred, x0 as i64, y0 as i64);
+    nd
+}
+
+/// Pixelate (mosaic) the half-open region `[x0, x1) × [y0, y1)` of `doc`
+/// (physical px) using `block`-px blocks (downsample to `rw/block × rh/block`
+/// with Nearest, then upsample back with Nearest for the classic blocky look)
+/// and return the resulting document. The region is clamped to doc bounds first;
+/// a degenerate region (`x1 <= x0` or `y1 <= y0`, including fully-off-canvas)
+/// is a no-op returning a clone of the input. Only the region changes.
+fn apply_mosaic_region(
+    doc: &RgbaImage,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    block: u32,
+) -> RgbaImage {
+    let (w, h) = (doc.width() as i32, doc.height() as i32);
+    let x0 = x0.max(0).min(w);
+    let x1 = x1.max(0).min(w);
+    let y0 = y0.max(0).min(h);
+    let y1 = y1.max(0).min(h);
+    if x1 <= x0 || y1 <= y0 {
+        return doc.clone();
+    }
+    let (rw, rh) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    let block = block.max(1);
+    let new_w = (rw / block).max(1);
+    let new_h = (rh / block).max(1);
+    let sub = image::imageops::crop_imm(doc, x0 as u32, y0 as u32, rw, rh).to_image();
+    let small = image::imageops::resize(&sub, new_w, new_h, image::imageops::FilterType::Nearest);
+    let big = image::imageops::resize(&small, rw, rh, image::imageops::FilterType::Nearest);
+    let mut nd = doc.clone();
+    image::imageops::replace(&mut nd, &big, x0 as i64, y0 as i64);
+    nd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1683,5 +1848,207 @@ mod tests {
             }
         }
         assert!(found_white, "expected white pixels near the arrow tip");
+    }
+
+    // --- apply_blur_region / apply_mosaic_region ----------------------------
+
+    /// 20×20 black doc with a 2×2 white block at (6,6)-(7,7): a sharp feature
+    /// inside the region so blur provably spreads it.
+    fn block_doc() -> RgbaImage {
+        let mut doc = RgbaImage::new(20, 20);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]);
+        }
+        for y in 6..8 {
+            for x in 6..8 {
+                doc.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        doc
+    }
+
+    /// True if any pixel strictly inside the half-open region differs between
+    /// `a` and `b`.
+    fn differs_inside(a: &RgbaImage, b: &RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// True if EVERY pixel outside the region is identical between `a` and `b`.
+    fn same_outside(a: &RgbaImage, b: &RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        let (w, h) = (a.width(), a.height());
+        for y in 0..h {
+            for x in 0..w {
+                let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
+                if !inside && a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn blur_changes_region_only() {
+        let doc = block_doc();
+        // Blur the region [2,2,12,12) (physical px). The 2×2 white block sits
+        // inside it, so the blurred output differs inside and is verbatim
+        // outside.
+        let out = apply_blur_region(&doc, 2, 2, 12, 12, 2.0);
+        assert!(
+            differs_inside(&doc, &out, 2, 2, 12, 12),
+            "region should change"
+        );
+        assert!(
+            same_outside(&doc, &out, 2, 2, 12, 12),
+            "outside must be unchanged"
+        );
+        // The block's core (6,6) was pure white; blur softens it toward gray.
+        assert_ne!(*out.get_pixel(6, 6), *doc.get_pixel(6, 6));
+        // An outside pixel is untouched black.
+        assert_eq!(*out.get_pixel(0, 0), *doc.get_pixel(0, 0));
+    }
+
+    #[test]
+    fn blur_degenerate_region_is_noop() {
+        let doc = block_doc();
+        // x1 == x0 → degenerate.
+        assert_eq!(apply_blur_region(&doc, 5, 5, 5, 10, 2.0), doc);
+        // y1 == y0 → degenerate.
+        assert_eq!(apply_blur_region(&doc, 5, 5, 10, 5, 2.0), doc);
+    }
+
+    #[test]
+    fn blur_off_canvas_region_is_noop() {
+        let doc = block_doc();
+        // Entirely off the right/bottom of a 20×20 doc → clamps to (20,20,30,30)
+        // → degenerate → no-op clone.
+        assert_eq!(apply_blur_region(&doc, 100, 100, 110, 110, 2.0), doc);
+    }
+
+    #[test]
+    fn blur_inverted_corners_still_works() {
+        let doc = block_doc();
+        // x1 < x0: the free function does NOT swap (contract is x0<=x1), so a
+        // strictly inverted region is treated as degenerate (no-op). Document
+        // that behavior so future refactors don't silently change it.
+        assert_eq!(apply_blur_region(&doc, 11, 11, 2, 2, 2.0), doc);
+    }
+
+    #[test]
+    fn mosaic_changes_region_only() {
+        let mut doc = RgbaImage::new(20, 20);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]); // black everywhere outside
+        }
+        // Inside region [4,4,16,16): a (x+y)-parity checkerboard of black/white.
+        for y in 4..16 {
+            for x in 4..16 {
+                let c = if (x + y) % 2 == 0 { 255 } else { 0 };
+                doc.put_pixel(x, y, image::Rgba([c, c, c, 255]));
+            }
+        }
+        let out = apply_mosaic_region(&doc, 4, 4, 16, 16, 4);
+        assert!(
+            differs_inside(&doc, &out, 4, 4, 16, 16),
+            "region should change"
+        );
+        assert!(
+            same_outside(&doc, &out, 4, 4, 16, 16),
+            "outside must be unchanged"
+        );
+        // Mosaic collapses the fine checkerboard into coarse blocks: a black
+        // checker pixel inside the region must have changed.
+        assert_ne!(*out.get_pixel(5, 4), *doc.get_pixel(5, 4));
+    }
+
+    #[test]
+    fn mosaic_produces_uniform_blocks() {
+        // A region split into 4-px blocks should have each block be a solid
+        // color: horizontally-adjacent pixels in the same block row-band are
+        // equal after upsampling.
+        let mut doc = RgbaImage::new(20, 8);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]);
+        }
+        // Left half white, right half black → strong vertical edge in region.
+        for y in 0..8 {
+            for x in 0..10 {
+                doc.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let out = apply_mosaic_region(&doc, 0, 0, 20, 8, 4);
+        // The first 4 columns are sampled from the white half (src x in 0..4)
+        // → all equal (white). Columns 0..4 share one mosaic value.
+        let p0 = *out.get_pixel(0, 0);
+        for x in 0..4 {
+            for y in 0..8 {
+                assert_eq!(*out.get_pixel(x, y), p0, "block pixel ({x},{y}) differs");
+            }
+        }
+    }
+
+    #[test]
+    fn mosaic_degenerate_region_is_noop() {
+        let doc = block_doc();
+        assert_eq!(apply_mosaic_region(&doc, 5, 5, 5, 10, 4), doc);
+        assert_eq!(apply_mosaic_region(&doc, 5, 5, 10, 5, 4), doc);
+    }
+
+    #[test]
+    fn mosaic_off_canvas_region_is_noop() {
+        let doc = block_doc();
+        assert_eq!(apply_mosaic_region(&doc, 100, 100, 110, 110, 4), doc);
+    }
+
+    #[test]
+    fn drag_region_physical_clamps_and_detects_degenerate() {
+        // 20×20 doc, scale 1. A clean 5×5 box at origin maps to (0,0,5,5).
+        let r = drag_region_physical(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(0.0, 0.0),
+            Pos2::new(5.0, 5.0),
+            1.0,
+            20,
+            20,
+        );
+        assert_eq!(r, Some((0, 0, 5, 5)));
+        // Dragged mostly off the bottom-right: clamps to the doc edge and is
+        // still a valid region.
+        let r = drag_region_physical(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(18.0, 18.0),
+            Pos2::new(40.0, 40.0),
+            1.0,
+            20,
+            20,
+        );
+        assert_eq!(r, Some((18, 18, 20, 20)));
+        // Fully off-canvas → degenerate (None).
+        let r = drag_region_physical(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(30.0, 30.0),
+            Pos2::new(40.0, 40.0),
+            1.0,
+            20,
+            20,
+        );
+        assert_eq!(r, None);
+        // Off-canvas origin but the drag re-enters the doc → valid clamped.
+        let r = drag_region_physical(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(-5.0, -5.0),
+            Pos2::new(5.0, 5.0),
+            1.0,
+            20,
+            20,
+        );
+        assert_eq!(r, Some((0, 0, 5, 5)));
     }
 }
