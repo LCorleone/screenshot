@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2.32"
 anyhow = "1.0.102"
 arboard = "3.6.1"
 directories = "6.0.0"

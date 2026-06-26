@@ -22,11 +22,16 @@
 //! rect `sel` (its original position), so a logical point `(lx,ly)` relative to
 //! `sel.min` maps to doc physical `(lx*scale, ly*scale)`.
 //!
-//! All annotation tools share one fixed style: a white ~2px stroke with a thin
-//! dark backing for contrast on light backgrounds. There is no color/width UI.
+//! Annotation styling is session-global and user-controlled via the toolbar:
+//! a color (one of six presets) and a stroke width (1/2/4 logical px). Rect,
+//! Arrow and Pencil use both; Text bakes glyphs in the active color (its size
+//! is fixed ~16 logical px, DPI-scaled) via ab_glyph + the bundled Geist Sans;
+//! Blur and Mosaic ignore both. There is no dark backing — strokes are a pure
+//! single pass in the active color.
 
 use std::sync::{Arc, Mutex};
 
+use ab_glyph::{Font, FontVec, Point, PxScale, ScaleFont};
 use eframe::egui;
 use egui::{Align2, Color32, Key, Pos2, Rect, Stroke, Vec2};
 use image::RgbaImage;
@@ -43,10 +48,25 @@ const UNDO_CAP: usize = 10;
 /// Soft byte budget for the undo stack (~256 MB). Oldest snapshots are dropped
 /// once exceeded, in addition to the [`UNDO_CAP`] count limit.
 const UNDO_BYTES_BUDGET: usize = 256 * 1024 * 1024;
-/// Dark backing color used behind every white annotation stroke.
-const STROKE_DARK: [u8; 4] = [0, 0, 0, 255];
-/// Foreground (white) color used for every annotation stroke.
-const STROKE_WHITE: [u8; 4] = [255, 255, 255, 255];
+/// Default annotation color (a clear red).
+const ACTIVE_COLOR_DEFAULT: Color32 = Color32::from_rgb(220, 0, 0);
+/// Default annotation stroke width, in logical px.
+const ACTIVE_WIDTH_DEFAULT: f32 = 2.0;
+/// Logical text size baked by the ab_glyph renderer (DPI-scaled to physical).
+const TEXT_LOGICAL_SIZE: f32 = 16.0;
+/// Bundled Geist Sans (Regular), parsed on demand by the text rasterizer.
+/// Keeping it as `&'static [u8]` avoids storing a `!Sync` `FontVec` on the
+/// `Arc<Mutex<RegionSession>>` (the parse per text commit is infrequent).
+const GEIST_FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/Geist-Regular.ttf");
+/// Preset colors offered by the Color popover, in toolbar order.
+const COLOR_PRESETS: [Color32; 6] = [
+    Color32::from_rgb(220, 0, 0),     // red
+    Color32::from_rgb(46, 204, 113),  // green
+    Color32::from_rgb(0, 110, 254),   // blue
+    Color32::from_rgb(241, 196, 15),  // yellow
+    Color32::from_rgb(0, 0, 0),       // black
+    Color32::from_rgb(255, 255, 255), // white
+];
 
 /// Overlay phase.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,7 +88,7 @@ pub enum Tool {
     Arrow,
     /// Pencil / freehand polyline tool.
     Pencil,
-    /// Text tool (in-place single-line text, baked via a 5x7 bitmap font).
+    /// Text tool (in-place single-line text, baked via ab_glyph Geist Sans).
     Text,
     /// Gaussian blur applied to the dragged region (drag a box, release).
     Blur,
@@ -102,6 +122,8 @@ enum ToolbarAction {
     ToggleText,
     ToggleBlur,
     ToggleMosaic,
+    SetColor(Color32),
+    SetWidth(f32),
     Undo,
     Pin,
     Save,
@@ -140,6 +162,10 @@ pub struct RegionSession {
     // --- Edit-phase state ---
     /// Active annotation tool.
     pub active_tool: Tool,
+    /// Session-global annotation color (applies to Rect/Arrow/Pencil/Text).
+    pub active_color: Color32,
+    /// Session-global annotation stroke width in logical px (Rect/Arrow/Pencil).
+    pub active_width: f32,
     /// The cropped document (editor canvas), in physical pixels.
     pub doc: Option<RgbaImage>,
     /// egui texture over `doc`; re-uploaded only when the doc changes.
@@ -187,6 +213,8 @@ impl RegionSession {
             drag_cur: None,
             hover_rect: None,
             active_tool: Tool::None,
+            active_color: ACTIVE_COLOR_DEFAULT,
+            active_width: ACTIVE_WIDTH_DEFAULT,
             doc: None,
             doc_texture: None,
             doc_rect: None,
@@ -260,36 +288,30 @@ impl RegionSession {
         self.undo_stack.iter().map(|img| img.len()).sum()
     }
 
-    /// Bake the in-progress text into the document at its anchor (dark backing
-    /// rect + white 5x7 glyphs), push it via [`Self::commit_doc`], then clear
-    /// all text state. An empty buffer is a no-op (just clears the state).
+    /// Bake the in-progress text into the document at its anchor as
+    /// active-color Geist glyphs (anti-aliased via ab_glyph), push it via
+    /// [`Self::commit_doc`], then clear all text state. An empty buffer is a
+    /// no-op (just clears state).
     fn commit_text(&mut self, ctx: &egui::Context) {
         let anchor = self.text_anchor;
         let drect = self.doc_rect;
         let scale = self.scale;
-        // 2x round(scale): at 100% DPI this yields 10x14 glyphs (vs the 5x7
-        // the raw scale gave), closer to the ~13pt live TextEdit preview.
-        // Min 2 for legibility. The 5x7 FONT TABLE itself is unchanged.
-        let scale_i = ((scale * 2.0).round() as i32).max(2);
+        let color = self.active_color;
         let buf = self.text_buf.trim().to_string();
         let base = self.doc.clone();
         if let (Some(anchor), Some(drect), Some(base)) = (anchor, drect, base) {
             if !buf.is_empty() {
+                // Anchor → doc physical px (top-left of the text box).
                 let ax = ((anchor.x - drect.min.x) * scale).round() as i32;
                 let ay = ((anchor.y - drect.min.y) * scale).round() as i32;
+                let px_size = TEXT_LOGICAL_SIZE * scale;
                 let mut nd = base;
-                let (tw, th) = text_bounds(&buf, scale_i);
-                // Dark backing rect with ~1 glyph-unit padding for legibility.
-                fill_solid_rect(
-                    &mut nd,
-                    ax - scale_i,
-                    ay - scale_i,
-                    ax + tw + scale_i - 1,
-                    ay + th + scale_i - 1,
-                    STROKE_DARK,
-                );
-                rasterize_text(&mut nd, ax, ay, &buf, scale_i, STROKE_WHITE);
-                self.commit_doc(ctx, nd);
+                match rasterize_text(&mut nd, ax, ay, &buf, px_size, color, GEIST_FONT_BYTES) {
+                    Ok(()) => self.commit_doc(ctx, nd),
+                    Err(_) => {
+                        tracing::warn!("Geist font parse failed while committing text; skipping")
+                    }
+                }
             }
         }
         self.text_editing = false;
@@ -352,6 +374,8 @@ struct ReadData {
     doc_rect: Option<Rect>,
     doc_tex_id: Option<egui::TextureId>,
     active_tool: Tool,
+    active_color: Color32,
+    active_width: f32,
     tool_drag_start: Option<Pos2>,
     tool_drag_cur: Option<Pos2>,
     pencil_points: Vec<Pos2>,
@@ -399,6 +423,8 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             doc_rect: g.doc_rect,
             doc_tex_id: g.doc_texture.as_ref().map(|t| t.id()),
             active_tool: g.active_tool,
+            active_color: g.active_color,
+            active_width: g.active_width,
             tool_drag_start: g.tool_drag_start,
             tool_drag_cur: g.tool_drag_cur,
             pencil_points: g.pencil_points.clone(),
@@ -481,21 +507,18 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
             match r.active_tool {
                 Tool::Rect => {
                     if let (Some(ds), Some(dc)) = (r.tool_drag_start, r.tool_drag_cur) {
-                        paint_rect_preview(&painter, ds, dc);
+                        paint_rect_preview(&painter, ds, dc, r.active_color, r.active_width);
                     }
                 }
                 Tool::Arrow => {
                     if let (Some(ds), Some(dc)) = (r.tool_drag_start, r.tool_drag_cur) {
-                        paint_arrow_preview(&painter, ds, dc);
+                        paint_arrow_preview(&painter, ds, dc, r.active_color, r.active_width);
                     }
                 }
                 Tool::Pencil => {
                     if r.pencil_points.len() >= 2 {
-                        let dark =
-                            egui::epaint::PathStroke::new(3.0, Color32::from_black_alpha(220));
-                        let white = egui::epaint::PathStroke::new(2.0, Color32::WHITE);
-                        painter.line(r.pencil_points.clone(), dark);
-                        painter.line(r.pencil_points.clone(), white);
+                        let stroke = egui::epaint::PathStroke::new(r.active_width, r.active_color);
+                        painter.line(r.pencil_points.clone(), stroke);
                     }
                 }
                 Tool::Blur | Tool::Mosaic => {
@@ -526,6 +549,8 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
     if r.phase == Phase::Edit {
         if let Some(sel) = r.doc_rect {
             let active_tool = r.active_tool;
+            let active_color = r.active_color;
+            let active_width = r.active_width;
             let undo_available = r.undo_available;
             let is_active = |t: Tool| active_tool == t;
             let pos = toolbar_position(sel, screen);
@@ -561,6 +586,13 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                 }
                                 if tool_button(ui, "Mosaic", is_active(Tool::Mosaic)) {
                                     action = Some(ToolbarAction::ToggleMosaic);
+                                }
+                                // Color + Size popovers (session-global annotation styling).
+                                if let Some(a) = color_picker_button(ui, active_color) {
+                                    action = Some(a);
+                                }
+                                if let Some(a) = size_picker_button(ui, active_width) {
+                                    action = Some(a);
                                 }
                                 if ui
                                     .add_enabled(
@@ -619,7 +651,7 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut buf)
                                     .desired_width(180.0)
-                                    .text_color(Color32::WHITE),
+                                    .text_color(r.active_color),
                             );
                             if wants_focus && !resp.has_focus() {
                                 resp.request_focus();
@@ -821,6 +853,12 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                         Tool::Mosaic
                     };
                 }
+                Some(ToolbarAction::SetColor(c)) => {
+                    g.active_color = c;
+                }
+                Some(ToolbarAction::SetWidth(w)) => {
+                    g.active_width = w;
+                }
                 Some(ToolbarAction::Undo) => {
                     if let Some(prev) = g.undo_stack.pop() {
                         g.doc = Some(prev);
@@ -881,13 +919,27 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                                         match g.active_tool {
                                             Tool::Rect => {
                                                 let mut nd = base;
-                                                rasterize_rect(&mut nd, drect.min, ds, dc, g.scale);
+                                                rasterize_rect(
+                                                    &mut nd,
+                                                    drect.min,
+                                                    ds,
+                                                    dc,
+                                                    g.scale,
+                                                    g.active_color,
+                                                    g.active_width,
+                                                );
                                                 g.commit_doc(&ctx, nd);
                                             }
                                             Tool::Arrow => {
                                                 let mut nd = base;
                                                 rasterize_arrow(
-                                                    &mut nd, drect.min, ds, dc, g.scale,
+                                                    &mut nd,
+                                                    drect.min,
+                                                    ds,
+                                                    dc,
+                                                    g.scale,
+                                                    g.active_color,
+                                                    g.active_width,
                                                 );
                                                 g.commit_doc(&ctx, nd);
                                             }
@@ -948,7 +1000,14 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
                         } else if canvas_released && g.pencil_points.len() >= 2 {
                             if let Some(base) = g.doc.clone() {
                                 let mut nd = base;
-                                rasterize_pencil(&mut nd, drect.min, &g.pencil_points, g.scale);
+                                rasterize_pencil(
+                                    &mut nd,
+                                    drect.min,
+                                    &g.pencil_points,
+                                    g.scale,
+                                    g.active_color,
+                                    g.active_width,
+                                );
                                 g.commit_doc(&ctx, nd);
                             }
                             g.pencil_points.clear();
@@ -984,32 +1043,22 @@ pub fn draw_overlay(ui: &mut egui::Ui, session: &Arc<Mutex<RegionSession>>) {
 
 // --- Live-preview painters (logical-space; mirror the rasterizers) ----------
 
-/// Live rectangle preview: dark outer band then a white inner band inset by
-/// ~1 logical pt.
-fn paint_rect_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
+/// Live rectangle preview: a single outline in the active color/width.
+fn paint_rect_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2, color: Color32, width: f32) {
     let rect = Rect::from_two_pos(ds, dc);
     painter.rect_stroke(
         rect,
         0.0,
-        Stroke::new(3.0, Color32::from_black_alpha(220)),
-        egui::epaint::StrokeKind::Inside,
-    );
-    let inner = rect.shrink2(Vec2::splat(1.0));
-    painter.rect_stroke(
-        inner,
-        0.0,
-        Stroke::new(2.0, Color32::WHITE),
+        Stroke::new(width, color),
         egui::epaint::StrokeKind::Inside,
     );
 }
 
-/// Live arrow preview: dark+white shaft then a chevron head at the current
-/// pointer (tip), pointing back toward the drag start.
-fn paint_arrow_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
-    let dark = Stroke::new(3.0, Color32::from_black_alpha(220));
-    let white = Stroke::new(2.0, Color32::WHITE);
-    painter.line_segment([ds, dc], dark);
-    painter.line_segment([ds, dc], white);
+/// Live arrow preview: a single-color shaft + chevron head (tip at the current
+/// pointer) in the active color/width.
+fn paint_arrow_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2, color: Color32, width: f32) {
+    let stroke = Stroke::new(width, color);
+    painter.line_segment([ds, dc], stroke);
     let dir = dc - ds;
     let len = dir.length();
     if len > 1.0 {
@@ -1025,8 +1074,7 @@ fn paint_arrow_preview(painter: &egui::Painter, ds: Pos2, dc: Pos2) {
                 head_len * (cos_a * u.y + sign * sin_a * perp.y),
             );
             let barb = dc - back;
-            painter.line_segment([dc, barb], dark);
-            painter.line_segment([dc, barb], white);
+            painter.line_segment([dc, barb], stroke);
         }
     }
 }
@@ -1060,12 +1108,86 @@ fn tool_button(ui: &mut egui::Ui, label: &'static str, active: bool) -> bool {
     ui.add(btn).clicked()
 }
 
+/// Pick a legible text color (black/white) for a button filled with `c`.
+fn contrast_text_color(c: Color32) -> Color32 {
+    // Rec. 709 luma: dark fills → white text, light fills → black text, so the
+    // Color trigger stays readable for every preset (incl. black & white).
+    let luma = 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
+    if luma > 140.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// A filled square swatch used inside the Color popover; the active swatch gets
+/// an accent outline.
+fn color_swatch_button(c: Color32, selected: bool) -> egui::Button<'static> {
+    let stroke = if selected {
+        egui::Stroke::new(2.0, crate::ui::theme::ACCENT_BLUE_BRIGHT)
+    } else {
+        egui::Stroke::new(1.0, crate::ui::theme::BORDER_STRONG)
+    };
+    egui::Button::new("")
+        .fill(c)
+        .stroke(stroke)
+        .min_size(egui::vec2(22.0, 22.0))
+        .corner_radius(egui::CornerRadius::same(crate::ui::theme::RADIUS_SM))
+}
+
+/// Color popover: a trigger button filled with the active color (contrast label)
+/// that opens a 6-swatch picker. Returns `SetColor(c)` if a swatch was clicked.
+/// Rendered inline in the toolbar's horizontal flow; the popup floats above the
+/// canvas, so its clicks never reach the editor canvas interaction.
+fn color_picker_button(ui: &mut egui::Ui, active_color: Color32) -> Option<ToolbarAction> {
+    let trigger =
+        egui::Button::new(egui::RichText::new("Color").color(contrast_text_color(active_color)))
+            .fill(active_color)
+            .stroke(egui::Stroke::new(1.0, crate::ui::theme::BORDER_STRONG))
+            .min_size(egui::vec2(0.0, 36.0))
+            .corner_radius(egui::CornerRadius::same(crate::ui::theme::RADIUS_SM));
+    let resp = ui.add(trigger);
+    let mut picked = None;
+    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+        ui.horizontal(|ui| {
+            for c in COLOR_PRESETS {
+                if ui.add(color_swatch_button(c, c == active_color)).clicked() {
+                    picked = Some(ToolbarAction::SetColor(c));
+                }
+            }
+        });
+    });
+    picked
+}
+
+/// Size popover: a "Size" trigger opening 1/2/4-px width presets; the active
+/// width is marked with a checkmark. Returns `SetWidth(w)` on selection.
+fn size_picker_button(ui: &mut egui::Ui, active_width: f32) -> Option<ToolbarAction> {
+    let resp = ui.add(crate::ui::theme::secondary_button("Size"));
+    let mut picked = None;
+    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+        ui.set_min_width(54.0);
+        for &w in &[1.0_f32, 2.0, 4.0] {
+            let active = (active_width - w).abs() < 0.01;
+            let label = if active {
+                format!("{w:.0} px  ✓")
+            } else {
+                format!("{w:.0} px")
+            };
+            if ui.add(crate::ui::theme::secondary_button(label)).clicked() {
+                picked = Some(ToolbarAction::SetWidth(w));
+            }
+        }
+    });
+    picked
+}
+
 /// Pick a toolbar position just outside the selection's bottom-right corner,
 /// flipping to the opposite side (above-left) when it would run off-screen.
 /// Uses a rough toolbar size estimate; it only needs to be approximately right.
 fn toolbar_position(sel: Rect, screen: Rect) -> Pos2 {
-    // 12 buttons * ~56pt each, ~48pt tall with padding.
-    let tb_w = 12.0 * 56.0;
+    // ~14 buttons * ~56pt each, ~48pt tall with padding (rough, for flipping).
+    let tb_w = 14.0 * 56.0;
     let tb_h = 48.0;
     let mut pos = sel.max + Vec2::new(4.0, 4.0);
     if pos.x + tb_w > screen.max.x {
@@ -1079,17 +1201,19 @@ fn toolbar_position(sel: Rect, screen: Rect) -> Pos2 {
 
 // --- Rasterizers (doc = physical pixels) ------------------------------------
 
-/// Rasterize a rectangle stroke onto `doc` (physical pixels). `sel_min_logical`
-/// is the doc's top-left in overlay-local logical coords; `drag_start` /
-/// `drag_cur` are the stroke's corners in the same space. The stroke is a
-/// white ~2-logical-px outline with a thin (~1px) dark outline behind it for
-/// contrast on light backgrounds.
+/// Rasterize a rectangle stroke onto `doc` (physical pixels) as a single
+/// `color` outline of `width` logical px (→ `width*scale` physical, min 1).
+/// `sel_min_logical` is the doc's top-left in overlay-local logical coords;
+/// `drag_start` / `drag_cur` are the stroke's corners in the same space. No
+/// dark backing — a pure single-pass outline in the active color.
 fn rasterize_rect(
     doc: &mut RgbaImage,
     sel_min_logical: Pos2,
     drag_start: Pos2,
     drag_cur: Pos2,
     scale: f32,
+    color: Color32,
+    width: f32,
 ) {
     let to_px = |p: Pos2| -> (i32, i32) {
         (
@@ -1104,34 +1228,23 @@ fn rasterize_rect(
     let rx1 = ax.max(bx);
     let ry1 = ay.max(by);
 
-    let t_white = ((2.0 * scale).round() as i32).max(1);
-    let t_dark = ((1.0 * scale).round() as i32).max(1);
-
-    // Dark outer band first...
-    fill_border_ring(doc, rx0, ry0, rx1, ry1, t_white + t_dark, STROKE_DARK);
-    // ...then white inner band (inset by t_dark), leaving a thin dark ring.
-    if rx1 - rx0 > 2 * t_dark && ry1 - ry0 > 2 * t_dark {
-        fill_border_ring(
-            doc,
-            rx0 + t_dark,
-            ry0 + t_dark,
-            rx1 - t_dark,
-            ry1 - t_dark,
-            t_white,
-            STROKE_WHITE,
-        );
-    }
+    let t = ((width * scale).round() as i32).max(1);
+    let c = [color.r(), color.g(), color.b(), color.a()];
+    fill_border_ring(doc, rx0, ry0, rx1, ry1, t, c);
 }
 
-/// Rasterize an arrow (shaft + chevron head) onto `doc`. Dark backing pass
-/// (thickness+1) then a white pass (thickness); the head is drawn the same way
-/// at the tip (`drag_cur`), pointing back toward `drag_start`.
+/// Rasterize an arrow (shaft + chevron head) onto `doc` as a single
+/// `color`/`width`-logical-px pass. Thickness = `width*scale` physical (min 1);
+/// the head is drawn the same way at the tip (`drag_cur`), pointing back toward
+/// `drag_start`. No dark backing.
 fn rasterize_arrow(
     doc: &mut RgbaImage,
     sel_min_logical: Pos2,
     drag_start: Pos2,
     drag_cur: Pos2,
     scale: f32,
+    color: Color32,
+    width: f32,
 ) {
     let to_px = |p: Pos2| -> (i32, i32) {
         (
@@ -1141,19 +1254,24 @@ fn rasterize_arrow(
     };
     let (x0, y0) = to_px(drag_start);
     let (x1, y1) = to_px(drag_cur);
-    let t_white = ((2.0 * scale).round() as i32).max(1);
-    let t_dark = t_white + 1;
+    let t = ((width * scale).round() as i32).max(1);
+    let c = [color.r(), color.g(), color.b(), color.a()];
 
-    rasterize_thick_line(doc, x0, y0, x1, y1, t_dark, STROKE_DARK);
-    rasterize_thick_line(doc, x0, y0, x1, y1, t_white, STROKE_WHITE);
+    rasterize_thick_line(doc, x0, y0, x1, y1, t, c);
     // Head at the tip (x1,y1); "base" direction is back toward (x0,y0).
-    rasterize_arrowhead(doc, x1, y1, x0, y0, t_dark, STROKE_DARK, scale);
-    rasterize_arrowhead(doc, x1, y1, x0, y0, t_white, STROKE_WHITE, scale);
+    rasterize_arrowhead(doc, x1, y1, x0, y0, t, c, scale);
 }
 
-/// Rasterize a freehand polyline (the Pencil commit core). Dark backing then
-/// white, thick-lined segment by segment.
-fn rasterize_pencil(doc: &mut RgbaImage, sel_min_logical: Pos2, points: &[Pos2], scale: f32) {
+/// Rasterize a freehand polyline (the Pencil commit core) as a single
+/// `color`/`width`-logical-px thick polyline, segment by segment. No backing.
+fn rasterize_pencil(
+    doc: &mut RgbaImage,
+    sel_min_logical: Pos2,
+    points: &[Pos2],
+    scale: f32,
+    color: Color32,
+    width: f32,
+) {
     let to_px = |p: Pos2| -> (i32, i32) {
         (
             ((p.x - sel_min_logical.x) * scale).round() as i32,
@@ -1161,10 +1279,9 @@ fn rasterize_pencil(doc: &mut RgbaImage, sel_min_logical: Pos2, points: &[Pos2],
         )
     };
     let pts: Vec<(i32, i32)> = points.iter().map(|p| to_px(*p)).collect();
-    let t_white = ((2.0 * scale).round() as i32).max(1);
-    let t_dark = t_white + 1;
-    rasterize_polyline(doc, &pts, t_dark, STROKE_DARK);
-    rasterize_polyline(doc, &pts, t_white, STROKE_WHITE);
+    let t = ((width * scale).round() as i32).max(1);
+    let c = [color.r(), color.g(), color.b(), color.a()];
+    rasterize_polyline(doc, &pts, t, c);
 }
 
 /// Bresenham thick line: walk the line from (x0,y0) to (x1,y1) and stamp a
@@ -1281,30 +1398,6 @@ fn rasterize_polyline(doc: &mut RgbaImage, points: &[(i32, i32)], thickness: i32
     }
 }
 
-/// Fill the inclusive rect from `(x0,y0)` to `(x1,y1)` with `color`, clamped to
-/// image bounds. Used for the text backing.
-fn fill_solid_rect(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let px = image::Rgba(color);
-    let xs = x0.max(0);
-    let ys = y0.max(0);
-    let xe = x1.min(w - 1);
-    let ye = y1.min(h - 1);
-    for y in ys..=ye {
-        for x in xs..=xe {
-            img.put_pixel(x as u32, y as u32, px);
-        }
-    }
-}
-
-/// Bounds-checked `put_pixel` for the glyph renderer.
-fn put_pixel_clamped(img: &mut RgbaImage, x: i32, y: i32, px: image::Rgba<u8>) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    if x >= 0 && y >= 0 && x < w && y < h {
-        img.put_pixel(x as u32, y as u32, px);
-    }
-}
-
 /// Fill the `thickness`-pixel border ring of the half-open rect
 /// `[rx0, rx1) × [ry0, ry1)` with `color`, clamped to image bounds.
 fn fill_border_ring(
@@ -1339,183 +1432,64 @@ fn fill_border_ring(
     }
 }
 
-// --- 5x7 bitmap font --------------------------------------------------------
+// --- Text (ab_glyph + bundled Geist Sans) ----------------------------------
 
-/// Look up the 5x7 glyph (7 rows, MSB = leftmost of 5 cols) for a character.
-/// Lowercase maps to uppercase; unknown characters map to space (blank).
-/// Supported: A-Z, 0-9, space, and `.,!?-:/`.
-fn glyph_for(ch: char) -> [u8; 7] {
-    match ch.to_ascii_uppercase() {
-        ' ' | '\t' => [0; 7],
-        'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        'C' => [
-            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
-        ],
-        'D' => [
-            0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100,
-        ],
-        'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        'F' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'G' => [
-            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
-        ],
-        'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'I' => [
-            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        'J' => [
-            0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
-        ],
-        'K' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        'M' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        'N' => [
-            0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001,
-        ],
-        'O' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'V' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
-        ],
-        'X' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'Z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        '0' => [
-            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
-        ],
-        '1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => [
-            0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
-        ],
-        '4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => [
-            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
-        ],
-        '6' => [
-            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
-        ],
-        '.' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
-        ],
-        ',' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110, 0b00100,
-        ],
-        '!' => [
-            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
-        ],
-        '?' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
-        ],
-        '-' => [
-            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
-        ],
-        ':' => [
-            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
-        ],
-        '/' => [
-            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
-        ],
-        _ => [0; 7],
+/// Rasterize `text` at the doc-physical anchor `(doc_x0, doc_y0)` (top-left of
+/// the text box) using the bundled Geist font, at `px_size` physical px, as
+/// anti-aliased `color` glyphs alpha-blended over the existing pixels. Empty
+/// text is a no-op. Every glyph pixel is bounds-checked (off-canvas glyphs are
+/// skipped, never panic). Returns `Err` only if the font bytes fail to parse.
+fn rasterize_text(
+    doc: &mut RgbaImage,
+    doc_x0: i32,
+    doc_y0: i32,
+    text: &str,
+    px_size: f32,
+    color: Color32,
+    font_bytes: &[u8],
+) -> Result<(), ab_glyph::InvalidFont> {
+    if text.is_empty() {
+        return Ok(());
     }
-}
-
-/// Physical-pixel bounds of `s` rendered at `scale` (px per logical unit):
-/// width = `6*scale*(n-1) + 5*scale`, height = `7*scale`. Empty string → (0,0).
-fn text_bounds(s: &str, scale: i32) -> (i32, i32) {
-    if s.is_empty() {
-        return (0, 0);
-    }
-    let sc = scale.max(1);
-    let n = s.chars().count() as i32;
-    let w = 6 * sc * (n - 1) + 5 * sc;
-    (w, 7 * sc)
-}
-
-/// Rasterize `s` at `(x0, y0)` using the 5x7 bitmap font, scaled by `scale`
-/// (each font pixel becomes a `scale`×`scale` block). Advance is `6*scale` per
-/// glyph. All pixels are bounds-clamped; unknown chars render as blank space.
-fn rasterize_text(doc: &mut RgbaImage, x0: i32, y0: i32, s: &str, scale: i32, color: [u8; 4]) {
-    let sc = scale.max(1);
-    let px = image::Rgba(color);
-    let mut cx = x0;
-    for ch in s.chars() {
-        let glyph = glyph_for(ch);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..5u32 {
-                if (bits >> (4 - col)) & 1 == 1 {
-                    let gx = cx + (col as i32) * sc;
-                    let gy = y0 + (row as i32) * sc;
-                    for dy in 0..sc {
-                        for dx in 0..sc {
-                            put_pixel_clamped(doc, gx + dx, gy + dy, px);
-                        }
-                    }
+    let font = FontVec::try_from_vec_and_index(font_bytes.to_vec(), 0)?;
+    let scale = PxScale::from(px_size.max(1.0));
+    let scaled = font.as_scaled(scale);
+    let (dw, dh) = (doc.width() as i32, doc.height() as i32);
+    let cr = color.r();
+    let cg = color.g();
+    let cb = color.b();
+    // Pen starts at the box top-left; y = ascent() places the baseline correctly
+    // (glyphs hang below the pen y by their descent).
+    let mut x = 0.0;
+    let y = scaled.ascent();
+    for ch in text.chars() {
+        let glyph_id = scaled.glyph_id(ch);
+        let glyph = glyph_id.with_scale_and_position(scale, Point { x, y });
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            let min_x = bounds.min.x.round() as i32;
+            let min_y = bounds.min.y.round() as i32;
+            outlined.draw(|gx, gy, coverage: f32| {
+                if coverage <= 0.0 {
+                    return;
                 }
-            }
+                let px = doc_x0 + min_x + gx as i32;
+                let py = doc_y0 + min_y + gy as i32;
+                if px >= 0 && py >= 0 && px < dw && py < dh {
+                    let a = coverage.clamp(0.0, 1.0);
+                    let ia = 1.0 - a;
+                    let p = doc.get_pixel_mut(px as u32, py as u32);
+                    // Alpha-over compositing of the glyph color over the bg.
+                    p[0] = (cr as f32 * a + p[0] as f32 * ia).round() as u8;
+                    p[1] = (cg as f32 * a + p[1] as f32 * ia).round() as u8;
+                    p[2] = (cb as f32 * a + p[2] as f32 * ia).round() as u8;
+                    p[3] = 255;
+                }
+            });
         }
-        cx += 6 * sc;
+        x += scaled.h_advance(glyph_id);
     }
+    Ok(())
 }
 
 /// Map a logical selection rect to image UV coordinates.
@@ -1636,10 +1610,10 @@ mod tests {
     // --- fill_border_ring / rasterize_rect (existing, kept) -----------------
 
     #[test]
-    fn fill_border_ring_draws_a_white_outline_with_dark_outer_ring() {
-        // 12x8 doc, rect covering the whole doc, scale 1. White ~2px, dark ~1px.
+    fn rasterize_rect_draws_single_color_outline() {
+        // 12x8 doc, rect covering the whole doc, scale 1, width 2 → a 2px red
+        // ring; the interior mid-gray stays untouched (no dark backing anymore).
         let mut doc = image::RgbaImage::new(12, 8);
-        // Fill with a mid-gray so we can see both rings distinctly.
         for p in doc.pixels_mut() {
             *p = image::Rgba([128, 128, 128, 255]);
         }
@@ -1649,14 +1623,15 @@ mod tests {
             Pos2::new(0.0, 0.0),
             Pos2::new(12.0, 8.0),
             1.0,
+            Color32::from_rgb(220, 0, 0),
+            2.0,
         );
-        // Outer ring (1px) should be dark, next ring (2px) white, interior gray.
-        assert_eq!(*doc.get_pixel(0, 0), image::Rgba([0, 0, 0, 255])); // corner dark
-        assert_eq!(*doc.get_pixel(1, 1), image::Rgba([255, 255, 255, 255])); // white ring
-        assert_eq!(*doc.get_pixel(2, 2), image::Rgba([255, 255, 255, 255])); // white ring
-        assert_eq!(*doc.get_pixel(3, 3), image::Rgba([128, 128, 128, 255])); // interior untouched
-        // Bottom-right edge: outer dark on last col/row.
-        assert_eq!(*doc.get_pixel(11, 7), image::Rgba([0, 0, 0, 255]));
+        // Border ring (width 2 at scale 1) is red; corners + edges red.
+        assert_eq!(*doc.get_pixel(0, 0), image::Rgba([220, 0, 0, 255]));
+        assert_eq!(*doc.get_pixel(1, 1), image::Rgba([220, 0, 0, 255]));
+        assert_eq!(*doc.get_pixel(11, 7), image::Rgba([220, 0, 0, 255]));
+        // Interior is untouched mid-gray (no backing pass anymore).
+        assert_eq!(*doc.get_pixel(6, 4), image::Rgba([128, 128, 128, 255]));
     }
 
     #[test]
@@ -1778,52 +1753,91 @@ mod tests {
         assert_eq!(*doc.get_pixel(0, 0), image::Rgba([255, 255, 255, 255]));
     }
 
-    // --- rasterize_text / text_bounds ----------------------------------------
+    // --- rasterize_text (ab_glyph Geist) -------------------------------------
 
     #[test]
-    fn text_writes_glyph_pixels_within_bounds() {
-        let mut doc = image::RgbaImage::new(60, 20);
-        rasterize_text(&mut doc, 0, 0, "A", 1, [255, 255, 255, 255]);
-        // 'A' top row 0b01110 → cols 1,2,3 set at row 0; col 0 blank.
-        assert_eq!(*doc.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
-        assert_eq!(*doc.get_pixel(1, 0), image::Rgba([255, 255, 255, 255]));
-        // 'A' middle row 0b11111 → all of cols 0..=4 set at row 3.
-        for x in 0..5 {
-            assert_eq!(
-                *doc.get_pixel(x, 3),
-                image::Rgba([255, 255, 255, 255]),
-                "row 3 col {x}"
-            );
+    fn text_writes_colored_glyph_pixels() {
+        // Black doc; bake "Hello" in red at 24px. Some fully-covered (== red)
+        // glyph pixels must appear; background far from glyphs stays black.
+        let mut doc = image::RgbaImage::new(140, 40);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]);
         }
-        // Advance is 6: nothing of this 1-char string at x=5 (col 5 row 3 blank).
-        assert_eq!(*doc.get_pixel(5, 3), image::Rgba([0, 0, 0, 0]));
+        let color = Color32::from_rgb(220, 0, 0);
+        rasterize_text(&mut doc, 4, 4, "Hello", 24.0, color, GEIST_FONT_BYTES).unwrap();
+        let exact_red = image::Rgba([220, 0, 0, 255]);
+        assert!(
+            doc.pixels().any(|p| *p == exact_red),
+            "expected at least one fully-covered red glyph pixel"
+        );
+        // Background pixels far from the glyphs (bottom-right) stay black.
+        assert_eq!(*doc.get_pixel(138, 38), image::Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn text_uses_active_color_not_white() {
+        // A non-red color bakes in that exact color, confirming color threading
+        // (the old renderer was hard-coded white).
+        let mut doc = image::RgbaImage::new(140, 40);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]);
+        }
+        let color = Color32::from_rgb(46, 204, 113); // green
+        rasterize_text(&mut doc, 4, 4, "Hi", 24.0, color, GEIST_FONT_BYTES).unwrap();
+        let exact_green = image::Rgba([46, 204, 113, 255]);
+        assert!(
+            doc.pixels().any(|p| *p == exact_green),
+            "expected fully-covered green glyph pixels"
+        );
     }
 
     #[test]
     fn text_empty_is_noop() {
-        let mut doc = image::RgbaImage::new(10, 10);
+        let mut doc = image::RgbaImage::new(40, 40);
         let before = doc.clone();
-        rasterize_text(&mut doc, 0, 0, "", 1, [255, 255, 255, 255]);
+        rasterize_text(&mut doc, 0, 0, "", 24.0, Color32::WHITE, GEIST_FONT_BYTES).unwrap();
         assert_eq!(doc, before);
     }
 
     #[test]
-    fn text_unknown_char_renders_as_space_no_panic() {
-        let mut doc = image::RgbaImage::new(20, 10);
+    fn text_off_canvas_anchor_is_clamped_no_panic() {
+        let mut doc = image::RgbaImage::new(20, 20);
         let before = doc.clone();
-        // '@' is unsupported → blank (space) glyph; no panic, no pixels.
-        rasterize_text(&mut doc, 0, 0, "@", 1, [255, 255, 255, 255]);
+        // Anchor far off the top-left → every glyph pixel lands off-canvas and
+        // is skipped; nothing is drawn and nothing panics.
+        rasterize_text(
+            &mut doc,
+            -500,
+            -500,
+            "Hi",
+            24.0,
+            Color32::WHITE,
+            GEIST_FONT_BYTES,
+        )
+        .unwrap();
         assert_eq!(doc, before);
     }
 
     #[test]
-    fn text_bounds_basic() {
-        assert_eq!(text_bounds("", 1), (0, 0));
-        assert_eq!(text_bounds("A", 1), (5, 7));
-        // 6*1*(2-1) + 5*1 = 11
-        assert_eq!(text_bounds("AB", 1), (11, 7));
-        // scale 2: 6*2*(2-1) + 5*2 = 22, height 14
-        assert_eq!(text_bounds("AB", 2), (22, 14));
+    fn text_keeps_pixels_inside_doc_bounds() {
+        // Anchor near the right edge: some glyphs would overflow horizontally,
+        // but every written pixel must stay within the doc (no panic, no OOB).
+        let mut doc = image::RgbaImage::new(30, 40);
+        for p in doc.pixels_mut() {
+            *p = image::Rgba([0, 0, 0, 255]);
+        }
+        rasterize_text(
+            &mut doc,
+            24,
+            4,
+            "Hello",
+            24.0,
+            Color32::WHITE,
+            GEIST_FONT_BYTES,
+        )
+        .unwrap();
+        // First column (x=0) is left of the anchor and stays black.
+        assert_eq!(*doc.get_pixel(0, 10), image::Rgba([0, 0, 0, 255]));
     }
 
     // --- rasterize_arrow (smoke) --------------------------------------------
@@ -1837,17 +1851,19 @@ mod tests {
             Pos2::new(0.0, 0.0),
             Pos2::new(30.0, 10.0),
             1.0,
+            Color32::from_rgb(220, 0, 0),
+            2.0,
         );
-        // Tip region near (30,10) should have some white pixels.
-        let mut found_white = false;
+        // Tip region near (30,10) should have some red pixels.
+        let mut found_red = false;
         for y in 7..14 {
             for x in 27..34 {
-                if *doc.get_pixel(x as u32, y as u32) == image::Rgba([255, 255, 255, 255]) {
-                    found_white = true;
+                if *doc.get_pixel(x as u32, y as u32) == image::Rgba([220, 0, 0, 255]) {
+                    found_red = true;
                 }
             }
         }
-        assert!(found_white, "expected white pixels near the arrow tip");
+        assert!(found_red, "expected red pixels near the arrow tip");
     }
 
     // --- apply_blur_region / apply_mosaic_region ----------------------------
