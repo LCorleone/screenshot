@@ -261,6 +261,15 @@ fn install_style(ctx: &egui::Context) {
 /// Apply the visuals for `palette`. Light theme: faint darkening on hover,
 /// Solarized blue selection/accents, dark text on a warm-paper fill.
 fn install_visuals(ctx: &egui::Context, palette: &Palette) {
+    // Make the active egui theme match the palette so our visuals land in (and
+    // render from) the correct theme slot. Without this, egui defaults to the
+    // Dark theme and our light visuals can be overridden by the dark defaults.
+    ctx.set_theme(if palette.dark_mode {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
+
     let mut v = if palette.dark_mode {
         egui::Visuals::dark()
     } else {
