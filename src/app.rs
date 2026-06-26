@@ -12,17 +12,17 @@
 //!   does nothing.
 
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use crossbeam_channel::TryRecvError;
 use eframe::egui;
-use global_hotkey::GlobalHotKeyEvent;
-use global_hotkey::GlobalHotKeyManager;
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use image::RgbaImage;
 use tray_icon::TrayIcon;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+#[cfg(windows)]
+use win_hotkeys::{HotkeyManager, VKey};
 
 use crate::config::Settings;
 use crate::ui::pin_window;
@@ -80,9 +80,14 @@ pub struct ScreenshotDaiApp {
     settings_item: MenuItem,
     capture_item: MenuItem,
     quit_item: MenuItem,
-    /// Global-hotkey manager; kept alive to keep the hotkey registered.
-    #[allow(dead_code)]
-    hotkey_manager: Option<GlobalHotKeyManager>,
+    /// Receiver for global-hotkey presses. A dedicated background thread (the
+    /// low-level keyboard hook) sends a `()` each time the configured hotkey
+    /// fires; `ui()` polls this and flips `capture_requested`. On non-Windows
+    /// this is a never-producing channel (hotkey is inert).
+    hotkey_rx: crossbeam_channel::Receiver<()>,
+    /// True once we've logged that `hotkey_rx` is disconnected (the hook
+    /// thread died); avoids spamming the log every frame.
+    hotkey_disconnected_logged: bool,
 }
 
 impl ScreenshotDaiApp {
@@ -118,51 +123,47 @@ impl ScreenshotDaiApp {
             tracing::warn!("failed to create tray icon (continuing without it)");
         }
 
-        // --- Global hotkey manager + hotkey parsed from Settings at startup. ---
-        // Build the combo string (e.g. "Ctrl+Shift+S") from the configured
-        // modifier + key fields; parse via HotKey::from_str. On any parse or
-        // registration failure, fall back to the default Ctrl+Shift+S and log.
+        // --- Global hotkey: a low-level keyboard hook on its OWN thread. ---
+        // win-hotkeys installs a WH_KEYBOARD_LL hook + pumps its OWN Win32
+        // message loop on a dedicated thread, fully independent of eframe's
+        // window/focus — so the key fires system-wide regardless of which app
+        // is focused (the failure mode of global-hotkey, which relied on
+        // eframe's window message loop). The thread sends a `()` per press;
+        // `ui()` polls the receiver. Non-fatal: tray "Capture Region" still
+        // works if the hook fails to install.
         // Applied only at startup; changing the fields takes effect next launch.
-        let hotkey_manager = GlobalHotKeyManager::new()
-            .map_err(|e| {
-                tracing::warn!("failed to create global hotkey manager: {e}");
-                e
-            })
-            .ok();
-        if let Some(gm) = &hotkey_manager {
-            let mods = settings.hotkey_modifiers.trim();
-            let key = settings.hotkey_key.trim();
-            // A modifier-less global hotkey (e.g. "S") is valid and parses fine,
-            // but it will swallow that key system-wide while the app runs, so a
-            // user who clears the modifiers field does so deliberately.
-            let combo = if mods.is_empty() {
-                key.to_string()
-            } else {
-                format!("{mods}+{key}")
-            };
-            let fallback = || HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-            let hk = match HotKey::from_str(&combo) {
-                Ok(h) => h,
-                Err(e) => {
-                    if key.is_empty() {
-                        tracing::info!("no hotkey key configured; using Ctrl+Shift+S");
-                    } else {
-                        tracing::warn!(
-                            "failed to parse configured hotkey {combo:?}: {e}; using Ctrl+Shift+S"
-                        );
-                    }
-                    fallback()
+        #[cfg(windows)]
+        let hotkey_rx = {
+            let (trigger_vk, modifiers) =
+                parse_hotkey(&settings.hotkey_modifiers, &settings.hotkey_key);
+            let (tx, rx) = crossbeam_channel::unbounded::<()>();
+            std::thread::spawn(move || {
+                // new()/register_*/event_loop() all run on THIS thread: the
+                // LL hook + its message loop are owned by the thread that
+                // calls event_loop(), so everything is created here.
+                let mut manager: HotkeyManager<()> = HotkeyManager::new();
+                // Each press runs the callback (returns `()`); the return
+                // value is forwarded onto `tx` for `ui()` to poll.
+                manager.register_channel(tx);
+                if let Err(e) =
+                    manager.register_hotkey(VKey::from_vk_code(trigger_vk), &modifiers, || ())
+                {
+                    tracing::warn!("failed to register hotkey: {e}");
+                    return;
                 }
-            };
-            if let Err(e) = gm.register(hk) {
-                tracing::warn!(
-                    "failed to register hotkey {combo:?}: {e}; retrying with Ctrl+Shift+S"
-                );
-                if let Err(e) = gm.register(fallback()) {
-                    tracing::warn!("fallback hotkey registration also failed: {e}");
-                }
-            }
-        }
+                // Blocks forever: pumps the LL keyboard hook's own message
+                // loop. Dies with the process.
+                manager.event_loop();
+            });
+            rx
+        };
+        #[cfg(not(windows))]
+        let hotkey_rx = {
+            // No system-wide hotkey on non-Windows; keep the field inert
+            // (never produces, so `ui()`'s poll loop is a no-op).
+            let (_tx, rx) = crossbeam_channel::unbounded::<()>();
+            rx
+        };
 
         Self {
             settings,
@@ -181,7 +182,8 @@ impl ScreenshotDaiApp {
             settings_item,
             capture_item,
             quit_item,
-            hotkey_manager,
+            hotkey_rx,
+            hotkey_disconnected_logged: false,
         }
     }
 
@@ -211,8 +213,20 @@ impl eframe::App for ScreenshotDaiApp {
         let ctx = ui.ctx().clone();
 
         // --- 1. Poll the global-hotkey channel (just sets a flag). ---
-        while GlobalHotKeyEvent::receiver().try_recv().is_ok() {
-            self.capture_requested = true;
+        loop {
+            match self.hotkey_rx.try_recv() {
+                Ok(()) => self.capture_requested = true,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The hook thread died (shouldn't happen in normal use).
+                    // Stop receiving and log once to avoid spamming the log.
+                    if !self.hotkey_disconnected_logged {
+                        tracing::warn!("global hotkey channel disconnected; hotkey unavailable");
+                        self.hotkey_disconnected_logged = true;
+                    }
+                    break;
+                }
+            }
         }
 
         // --- 2. Poll the tray-menu channel. ---
@@ -434,6 +448,66 @@ impl eframe::App for ScreenshotDaiApp {
             );
         });
     }
+}
+
+/// Parse the configured hotkey into a Windows VK code + modifier list.
+///
+/// `key` is a single ASCII letter (A-Z -> 0x41..) or digit (0-9 -> 0x30..);
+/// anything else falls back to 'S' (0x53). `modifiers` is a '+'-separated list
+/// (e.g. "Ctrl+Shift"); an empty list yields a modifier-less hotkey (which
+/// swallows the key system-wide while the app runs — a deliberate user
+/// choice), and any unrecognized token falls back to Ctrl+Shift.
+#[cfg(windows)]
+fn parse_hotkey(mods: &str, key: &str) -> (u16, Vec<VKey>) {
+    // --- Trigger key -> Windows VK code (u16, as expected by VKey). ---
+    let trigger_vk: u16 = key
+        .trim()
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| {
+            let c = c.to_ascii_uppercase();
+            if ('A'..='Z').contains(&c) {
+                0x41 + (c as u16 - 'A' as u16)
+            } else {
+                0x30 + (c as u16 - '0' as u16)
+            }
+        })
+        .unwrap_or_else(|| {
+            tracing::warn!("failed to parse hotkey key {key:?}; using 'S'");
+            0x53 // 'S'
+        });
+
+    // --- Modifiers -> VKey list. ---
+    // An empty list is a valid (modifier-less) global hotkey, but it swallows
+    // the key system-wide while the app runs. Any unrecognized token falls
+    // back to Ctrl+Shift.
+    let tokens: Vec<&str> = mods
+        .trim()
+        .split('+')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    let modifiers = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        let mut list = Vec::with_capacity(tokens.len());
+        for t in &tokens {
+            match t.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => list.push(VKey::Control),
+                "shift" => list.push(VKey::Shift),
+                "alt" | "menu" => list.push(VKey::Menu),
+                "win" | "super" | "meta" => list.push(VKey::LWin),
+                other => {
+                    tracing::warn!("failed to parse hotkey modifier {other:?}; using Ctrl+Shift");
+                    return (trigger_vk, vec![VKey::Control, VKey::Shift]);
+                }
+            }
+        }
+        list
+    };
+
+    (trigger_vk, modifiers)
 }
 
 /// Copy an RGBA image to the system clipboard via `arboard`.

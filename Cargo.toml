@@ -7,10 +7,10 @@ edition = "2024"
 ab_glyph = "0.2.32"
 anyhow = "1.0.102"
 arboard = "3.6.1"
+crossbeam-channel = "0.5"
 directories = "6.0.0"
 eframe = "0.34.3"
 egui = "0.34.3"
-global-hotkey = "0.8.0"
 image = "0.25.10"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -21,6 +21,7 @@ tray-icon = "0.24.1"
 xcap = "0.9.6"
 
 [target.'cfg(windows)'.dependencies]
+win-hotkeys = "0.5.1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
