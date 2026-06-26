@@ -301,9 +301,15 @@ impl RegionSession {
         let base = self.doc.clone();
         if let (Some(anchor), Some(drect), Some(base)) = (anchor, drect, base) {
             if !buf.is_empty() {
-                // Anchor → doc physical px (top-left of the text box).
+                // Anchor → doc physical px (top-left of the text box). The live
+                // preview's `TextEdit` sits inside a Frame::group with an
+                // inner_margin, so the visible glyphs are offset down from the
+                // anchor by that margin (+ a little row padding). Nudge the
+                // baked baseline down by the frame's inner_margin (4 logical
+                // px) so the committed text lines up with what the user saw.
+                const TEXT_PREVIEW_INSET: f32 = 4.0;
                 let ax = ((anchor.x - drect.min.x) * scale).round() as i32;
-                let ay = ((anchor.y - drect.min.y) * scale).round() as i32;
+                let ay = ((anchor.y - drect.min.y + TEXT_PREVIEW_INSET) * scale).round() as i32;
                 let px_size = TEXT_LOGICAL_SIZE * scale;
                 let mut nd = base;
                 match rasterize_text(&mut nd, ax, ay, &buf, px_size, color, GEIST_FONT_BYTES) {
