@@ -148,8 +148,16 @@ impl ScreenshotDaiApp {
                 if let Err(e) =
                     manager.register_hotkey(VKey::from_vk_code(trigger_vk), &modifiers, || ())
                 {
-                    tracing::warn!("failed to register hotkey: {e}");
-                    return;
+                    // Registration failed (OS conflict / unusual combo):
+                    // retry once with the hardcoded Ctrl+Shift+S default.
+                    tracing::warn!("failed to register hotkey: {e}; retrying with Ctrl+Shift+S");
+                    let fallback = [VKey::Control, VKey::Shift];
+                    if let Err(e) =
+                        manager.register_hotkey(VKey::from_vk_code(0x53), &fallback, || ())
+                    {
+                        tracing::warn!("fallback hotkey registration also failed: {e}");
+                        return;
+                    }
                 }
                 // Blocks forever: pumps the LL keyboard hook's own message
                 // loop. Dies with the process.
@@ -159,10 +167,10 @@ impl ScreenshotDaiApp {
         };
         #[cfg(not(windows))]
         let hotkey_rx = {
-            // No system-wide hotkey on non-Windows; keep the field inert
-            // (never produces, so `ui()`'s poll loop is a no-op).
-            let (_tx, rx) = crossbeam_channel::unbounded::<()>();
-            rx
+            // No system-wide hotkey on non-Windows. Use a truly-inert channel
+            // (`never()` always returns Empty, never Disconnected) so the poll
+            // loop is a clean no-op and logs nothing.
+            crossbeam_channel::never::<()>()
         };
 
         Self {
@@ -213,9 +221,14 @@ impl eframe::App for ScreenshotDaiApp {
         let ctx = ui.ctx().clone();
 
         // --- 1. Poll the global-hotkey channel (just sets a flag). ---
+        // The low-level hook auto-repeats while the combo is held, so collapse
+        // all events drained this frame into a single press, and DISCARD any
+        // press while a session is already open (otherwise held-key repeats
+        // would chain into a fresh capture the moment the current one closes).
+        let mut got_press = false;
         loop {
             match self.hotkey_rx.try_recv() {
-                Ok(()) => self.capture_requested = true,
+                Ok(()) => got_press = true,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The hook thread died (shouldn't happen in normal use).
@@ -227,6 +240,9 @@ impl eframe::App for ScreenshotDaiApp {
                     break;
                 }
             }
+        }
+        if got_press && self.region_session.is_none() {
+            self.capture_requested = true;
         }
 
         // --- 2. Poll the tray-menu channel. ---
@@ -460,23 +476,29 @@ impl eframe::App for ScreenshotDaiApp {
 #[cfg(windows)]
 fn parse_hotkey(mods: &str, key: &str) -> (u16, Vec<VKey>) {
     // --- Trigger key -> Windows VK code (u16, as expected by VKey). ---
-    let trigger_vk: u16 = key
-        .trim()
-        .chars()
-        .next()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| {
-            let c = c.to_ascii_uppercase();
-            if ('A'..='Z').contains(&c) {
-                0x41 + (c as u16 - 'A' as u16)
+    // Only a SINGLE letter/digit is accepted. Multi-char values (e.g. "F5",
+    // "Space", "Enter") are NOT silently degraded to their first char — they
+    // fall back to 'S' with a warning. Named-key support can be added later.
+    let trigger_vk: u16 = {
+        let k = key.trim();
+        if k.chars().count() == 1 {
+            let c = k.chars().next().unwrap();
+            if c.is_ascii_alphanumeric() {
+                let c = c.to_ascii_uppercase();
+                if ('A'..='Z').contains(&c) {
+                    0x41 + (c as u16 - 'A' as u16)
+                } else {
+                    0x30 + (c as u16 - '0' as u16)
+                }
             } else {
-                0x30 + (c as u16 - '0' as u16)
+                tracing::warn!("failed to parse hotkey key {key:?}; using 'S'");
+                0x53 // 'S'
             }
-        })
-        .unwrap_or_else(|| {
-            tracing::warn!("failed to parse hotkey key {key:?}; using 'S'");
+        } else {
+            tracing::warn!("hotkey key {key:?} is not a single letter/digit; using 'S'");
             0x53 // 'S'
-        });
+        }
+    };
 
     // --- Modifiers -> VKey list. ---
     // An empty list is a valid (modifier-less) global hotkey, but it swallows
@@ -627,4 +649,48 @@ fn tray_icon_rgba() -> Vec<u8> {
     }
 
     rgba
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hotkey_default_combo() {
+        let (vk, mods) = parse_hotkey("Ctrl+Shift", "S");
+        assert_eq!(vk, 0x53);
+        assert_eq!(mods, vec![VKey::Control, VKey::Shift]);
+    }
+
+    #[test]
+    fn parse_hotkey_whitespace_and_case() {
+        let (vk, mods) = parse_hotkey(" ctrl + shift ", "s");
+        assert_eq!(vk, 0x53);
+        assert_eq!(mods, vec![VKey::Control, VKey::Shift]);
+    }
+
+    #[test]
+    fn parse_hotkey_digit_key() {
+        let (vk, _) = parse_hotkey("Ctrl", "1");
+        assert_eq!(vk, 0x31);
+    }
+
+    #[test]
+    fn parse_hotkey_multichar_key_falls_back_to_s() {
+        // Multi-char keys (e.g. "F5") must NOT silently degrade to char[0].
+        let (vk, _) = parse_hotkey("Ctrl+Shift", "F5");
+        assert_eq!(vk, 0x53, "multi-char key should fall back to 'S'");
+    }
+
+    #[test]
+    fn parse_hotkey_unknown_modifier_falls_back() {
+        let (_, mods) = parse_hotkey("Ctrl+Foo", "A");
+        assert_eq!(mods, vec![VKey::Control, VKey::Shift]);
+    }
+
+    #[test]
+    fn parse_hotkey_modifierless_is_allowed() {
+        let (_, mods) = parse_hotkey("", "A");
+        assert!(mods.is_empty(), "empty modifiers should yield no modifiers");
+    }
 }
