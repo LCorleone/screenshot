@@ -12,9 +12,11 @@ use std::sync::Arc;
 // --- Geist Dark tokens ------------------------------------------------------
 
 /// background-100
-pub const BG: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
-/// subtle card surface
-pub const SURFACE: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0a);
+/// background-100 (dark): a near-black neutral surface, NOT pure black
+/// (pure #000000 reads as "empty/broken" on Windows).
+pub const BG: Color32 = Color32::from_rgb(0x0e, 0x0e, 0x10);
+/// subtle card surface (slightly lighter than BG).
+pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x16, 0x19);
 /// gray-1000 — primary text
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xed, 0xed, 0xed);
 /// gray-900 — secondary text

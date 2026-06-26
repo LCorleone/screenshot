@@ -53,6 +53,10 @@ pub struct ScreenshotDaiApp {
     last_scale: f32,
     /// Whether the Settings window should currently be visible.
     window_visible: bool,
+    /// True once eframe has confirmed the window is actually hidden after the
+    /// initial launch (the root viewport can briefly paint on Windows before
+    /// `Visible(false)` is processed, showing an empty black frame).
+    hidden_confirmed: bool,
     /// Set (hotkey / tray) when a region capture has been requested but not
     /// yet started. Captures must start from within `ui()` where we have the
     /// egui ctx, so the global channel handlers just flip this flag.
@@ -99,17 +103,10 @@ impl ScreenshotDaiApp {
         let _ = menu.append(&sep);
         let _ = menu.append(&quit_item);
 
-        // --- Tray icon: a 16x16 solid accent-blue RGBA image, built in code. ---
+        // --- Tray icon: a 32x32 glyph drawn in code — accent-blue rounded
+        //     square with white screenshot-selection corner marks. ---
         let tray = (|| {
-            let icon = tray_icon::Icon::from_rgba(
-                std::iter::repeat([0x00u8, 0x6e, 0xfe, 0xff])
-                    .flatten()
-                    .take(16 * 16 * 4)
-                    .collect::<Vec<u8>>(),
-                16,
-                16,
-            )
-            .ok()?;
+            let icon = tray_icon::Icon::from_rgba(tray_icon_rgba(), 32, 32).ok()?;
             tray_icon::TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip("screenshot-dai")
@@ -175,6 +172,7 @@ impl ScreenshotDaiApp {
             region_session: None,
             last_scale: 1.0,
             window_visible: false,
+            hidden_confirmed: false,
             capture_requested: false,
             quitting: false,
             pins: Vec::new(),
@@ -197,6 +195,7 @@ impl ScreenshotDaiApp {
     /// command so eframe actually shows the (initially hidden) window.
     fn show_window(&mut self, ctx: &egui::Context) {
         self.window_visible = true;
+        self.hidden_confirmed = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
 
@@ -341,6 +340,18 @@ impl eframe::App for ScreenshotDaiApp {
 
         // When hidden, draw nothing else.
         if !self.window_visible {
+            // eframe quirk: the root viewport can briefly paint a black frame
+            // on launch before `Visible(false)` is processed. Keep pushing
+            // `Visible(false)` every frame until the window reports it's
+            // actually hidden, then stop (avoids spamming the command).
+            if !self.hidden_confirmed {
+                let actually_hidden = ctx.input(|i| i.viewport().visible() == Some(false));
+                if actually_hidden {
+                    self.hidden_confirmed = true;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+            }
             return;
         }
 
@@ -466,4 +477,80 @@ fn save_via_dialog(img: &RgbaImage) -> anyhow::Result<Option<PathBuf>> {
         }
         None => Ok(None),
     }
+}
+
+/// Build a 32x32 RGBA tray icon in code: an accent-blue rounded square with
+/// white screenshot-selection corner marks (a crop-frame motif). No asset
+/// files required.
+fn tray_icon_rgba() -> Vec<u8> {
+    const S: usize = 32;
+    // Accent blue (matches crate::ui::theme::ACCENT_BLUE).
+    let (br, bg, bb) = (0x00u8, 0x6eu8, 0xfeu8);
+    let (wr, wg, wb) = (0xffu8, 0xffu8, 0xffu8);
+    let mut rgba = vec![0u8; S * S * 4];
+
+    // Helper: set a pixel (x,y) to an opaque color.
+    let mut set = |x: i32, y: i32, (r, g, b): (u8, u8, u8)| {
+        if (0..S as i32).contains(&x) && (0..S as i32).contains(&y) {
+            let i = ((y as usize) * S + x as usize) * 4;
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 0xff;
+        }
+    };
+
+    // 1. Filled rounded square (inset margin = 4, corner radius = 6).
+    let m = 4i32;
+    let r = 6i32;
+    for y in 0..S as i32 {
+        for x in 0..S as i32 {
+            // distance-from-corner for the rounding test
+            let inside = x >= m && x < S as i32 - m && y >= m && y < S as i32 - m && {
+                // round the 4 corners
+                let dx = (x - m).min((S as i32 - 1 - m) - x).max(0);
+                let dy = (y - m).min((S as i32 - 1 - m) - y).max(0);
+                !(dx < r && dy < r && (r - dx).pow(2) + (r - dy).pow(2) < r * r && (dx.min(dy) < r))
+            };
+            if inside {
+                set(x, y, (br, bg, bb));
+            }
+        }
+    }
+
+    // 2. White crop-frame corner marks (L-shapes) at the four inner corners,
+    //    suggesting a screenshot selection. Inner region is [8..24].
+    let (x0, x1, y0, y1) = (8i32, 23i32, 8i32, 23i32);
+    let arm = 6i32; // length of each corner arm
+    let th = 2i32; // stroke thickness
+    // top-left corner
+    for i in 0..arm {
+        for t in 0..th {
+            set(x0 + i, y0 + t, (wr, wg, wb));
+            set(x0 + t, y0 + i, (wr, wg, wb));
+        }
+    }
+    // top-right corner
+    for i in 0..arm {
+        for t in 0..th {
+            set(x1 - i, y0 + t, (wr, wg, wb));
+            set(x1 - t, y0 + i, (wr, wg, wb));
+        }
+    }
+    // bottom-left corner
+    for i in 0..arm {
+        for t in 0..th {
+            set(x0 + i, y1 - t, (wr, wg, wb));
+            set(x0 + t, y1 - i, (wr, wg, wb));
+        }
+    }
+    // bottom-right corner
+    for i in 0..arm {
+        for t in 0..th {
+            set(x1 - i, y1 - t, (wr, wg, wb));
+            set(x1 - t, y1 - i, (wr, wg, wb));
+        }
+    }
+
+    rgba
 }
